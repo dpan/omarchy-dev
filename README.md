@@ -1,93 +1,106 @@
 # Omarchy Dev
 
-A local dev and test environment for [Omarchy](https://omarchy.org).
+Run stock [Omarchy](https://omarchy.org) or a feature checkout in a disposable VM. A shared installed base lets test runs skip installation.
 
-This workspace contains checkouts of Omarchy and its ISO test scripts, and provides mise tasks to:
+## Requirements
 
-- keep feature work in git worktrees
-- install Omarchy once into a shared VM base image
-- boot that image with stock Omarchy, or with your feature tree as the live system
-- optionally copy selected host desktop config into the guest for that run
+Use an x86_64 Omarchy host with KVM access, Git, and **mise 2026.10.19 or newer**. At least 20 GiB of free space is recommended.
 
-Clone anywhere, then `cd` into the checkout. Omarchy already activates mise. Use mise 2026.10.19 or newer.
+Setup needs network access and installs the host packages in [mise.toml](mise.toml), including QEMU and UEFI firmware.
 
 ## Quick start
 
-```bash
-mise trust                              # once per machine/path, if prompted
-mise setup                              # packages, clones, ISO, base image
-mise health                             # host + workspace readiness
-mise worktree -- add my-feature-worktree quattro
+Clone this repository, `cd` into it, and run:
 
-mise rebase list                        # ISOs you can rebase onto
-mise rebase status                      # active ISO / base image
-mise rebase                             # pick an ISO (gum), rebuild base
-mise rebase stable                      # or: edge | rc | version | ISO name
-mise test my-feature-worktree                    # desktop VM; worktree is live Omarchy
-mise test                               # same VM, stock Omarchy
-mise test --host-config                 # stock VM + selected host ~/.config
-mise test --host-config my-feature-worktree      # worktree + host config
-mise test --run-tests my-feature-worktree        # automated checks, then stop
-mise test --run-tests my-feature-worktree -- --keep-running
-mise test --ssh --no-grab-kbd -- --memory 4096   # stock guest, custom harness options
+```bash
+mise trust
+mise setup
+mise health
+mise worktree add my-feature
+mise test my-feature
 ```
 
-| Task | Meaning |
-|------|---------|
-| `mise setup` | Prepare workspace (ISO + base image if missing) |
-| `mise health` | Check host tools, clones, harness patch, ISO, base image |
-| `mise worktree -- add\|list\|remove …` | Feature worktrees under `worktrees/` |
-| `mise test` | Boot interactive VM (stock Omarchy), leave it running |
-| `mise test <tree>` | Boot VM with that worktree as live Omarchy |
-| `mise test --host-config [tree]` | Also copy selected host `~/.config` dirs (this run only) |
-| `mise test --run-tests [tree]` | Run automated checks, then stop |
-| `mise rebase list` | Print available ISOs (edge / stable / rc / local) |
-| `mise rebase` | Interactive pick, then rebuild the shared base image |
-| `mise rebase <target>` | Rebuild from `edge`, `stable`, `rc`, a version, ISO name, or path |
-| `mise rebase status` | Show active ISO + base image |
+Setup clones Omarchy's `quattro` branch and the ISO test repository, downloads the latest edge ISO, and prepares its base. For a stable base, use `mise setup --channel stable`.
 
-`test` opens a QEMU window and grabs the keyboard by default (Super in the guest; Left+Right Ctrl toggles grab). Also: `--ssh` (no window), `--no-grab-kbd`.
+The last command opens your feature desktop. Interactive VMs stay running after the command returns. Shut down the guest before starting another run.
 
-`--host-config` copies an allowlist from the host into the throwaway guest (default: `omarchy`, `hypr`, `alacritty`, `ghostty`, `kitty`, `foot`, `walker`; override with `OMARCHY_DEV_HOST_CONFIG_DIRS`). It does not persist on the base image — pass the flag each time. Ignored with `--run-tests`. Hypr monitor layout files are skipped.
+## Work on a feature
 
-`mise rebase edge|stable|rc` means that channel’s newest ISO (`rc` = newest prerelease in the list). A version or filename from `mise rebase list` selects exactly that image.
+Edit and commit in `worktrees/my-feature/`. New worktrees use branch `feature/<name>` and start from `quattro`. An optional final argument to `add` selects another branch or commit.
 
-Mise [forwards raw arguments](https://mise.jdx.dev/tasks/task-configuration.html#raw-args) to the wrappers, which own argument parsing. Put harness options after `--`; values containing spaces stay one argument. `--help` displays the wrapper's help.
+Use `mise worktree list` or `mise worktree remove my-feature` to manage host checkouts.
 
-Mise consumes the first `--`. To pass a literal separator to the wrapper, use `mise test <tree> -- -- --keep-running`. This preserves the boundary when forwarding values that resemble wrapper flags.
+Feature runs use a snapshot of the checkout, including uncommitted files and deletions. The desktop and acceptance tests use that snapshot. Re-run after host edits. Guest edits are not copied back.
 
-Setup flags are `--no-base`, `--no-iso`, `--no-packages`, and `--channel stable`. Setup prepares the exact channel ISO it resolves. `--no-iso` uses an existing local selection; combine it with `--no-base` to prepare checkouts without an ISO.
+## Run a VM
 
-## Base selection and completion
+Run `mise test` for stock Omarchy or `mise test <tree>` for a worktree name or checkout path. Add these options as needed:
 
-`omarchy-iso/test-runs/CURRENT` records the selected ISO's canonical path, including paths outside `release/`. Health and status only inspect selection. A missing selected ISO produces an error instead of silently selecting another image.
+| Option | Effect |
+| --- | --- |
+| `--run-tests` | Run automated checks, then stop the VM |
+| `--host-config` | Copy selected host configuration into an interactive guest |
+| `--ssh` | Run without a window; keyboard grab remains enabled |
+| `--no-grab-kbd` | Leave the host keyboard ungrabbed |
 
-Base reuse requires a `base.complete` record beside `base.qcow2`, matching the ISO and disk fingerprints, a valid qcow2 image, and readable firmware variables and SSH key files. The record is published only after installation and image validation succeed. Setup reuses a verified base or creates a missing one. It refuses an existing unverified disk so that a routine setup cannot overwrite it.
+VMs open a QEMU window and grab the keyboard by default. Press **Left Ctrl + Right Ctrl** to toggle the grab. For headless use without host input capture, add `--ssh --no-grab-kbd`.
 
-Existing bases made before this completion check need one explicit rebuild with `mise rebase <target>`. `mise rebase list` shows available targets. No completion record is inferred from file size. Keep an external ISO at its selected path; moving or replacing it requires another explicit rebase.
+Use `mise test --help` for all options.
 
-## Harness updates
+Pass ISO harness options after **`-- --`**. Mise consumes the first separator and the wrapper consumes the second:
 
-Setup and test verify that the tracked patch's changes are applied. A clean upstream harness receives the patch. A stale or conflicting local version causes an error and remains untouched. Reconcile the local harness diff with `patches/omarchy-iso-test.patch` before retrying. Regenerating a patch from an unmodified harness does not repair an apply failure.
+```bash
+mise test --run-tests my-feature -- -- --keep-running
+mise test --ssh --no-grab-kbd -- -- --memory 4096
+```
 
-Worktree sync preserves dirty additions, deletions, file modes, and symlinks with independent Git metadata. Both the desktop and acceptance suite use the activated guest checkout. Required startup, sync, and activation failures stop the run. Host-config transfer failures also stop the run.
+Each run uses a fresh disk overlay and leaves the base disk unchanged.
 
-## Layout
+### Copy host configuration
 
-| Path | What |
-|------|------|
-| `omarchy/` | Main Omarchy checkout; hub for git worktrees |
-| `worktrees/<name>/` | Feature branch checkouts (commit here as usual) |
-| `omarchy-iso/` | Harness, downloaded ISOs, base image under `test-runs/` |
-| `patches/` | Tracked patch applied to local `omarchy-iso-test` |
-| `bin/` | Wrappers invoked by the mise tasks |
+`--host-config` copies `omarchy`, `hypr`, `alacritty`, `ghostty`, `kitty`, `foot`, and `walker` from host `~/.config`. Override the list with `OMARCHY_DEV_HOST_CONFIG_DIRS`.
 
-Nested trees stay inside this checkout (do not symlink them out).
+The copy skips `hypr/monitors.conf` and `hypr/monitors.lua`, applies only to that run, and is ignored with `--run-tests`.
 
-## Wrapper regression checks
+## Select or rebuild the base
 
-Run `python -m unittest discover -s tests -v`. The suite uses temporary repositories, tiny qcow2 images, and inert VM and network commands. It requires Python 3, Git, jq, qemu-img, and mise. Harness checks also require the local `omarchy-iso` checkout; those checks are skipped when it is absent. No VM is booted by this suite.
+```bash
+mise rebase list      # List available remote and local ISOs
+mise rebase stable    # Build and select a base from the latest stable ISO
+mise rebase status   # Inspect the selected ISO and base
+```
+
+Targets are `edge`, `stable`, `rc`, a listed version or ISO filename, or a local ISO path. Channels select the newest available image. With no target, `mise rebase` opens a picker using `gum`.
+
+Rebase reinstalls and selects the chosen base. Setup creates a missing base or reuses a verified one. Existing disks without valid `base.complete` evidence require an explicit rebase, including older bases. Keep selected ISOs at their paths. Moving or replacing one can require a rebuild.
+
+## Setup options
+
+Setup accepts `--no-packages`, `--no-base`, and `--no-iso` to skip those steps. With `--no-iso`, base preparation uses an existing local ISO. Combine `--no-iso --no-base` for checkouts only. Use `mise setup --help` for details.
+
+## Files and recovery
+
+| Path | Contents |
+| --- | --- |
+| `omarchy/` | Base source checkout and Git worktree hub |
+| `worktrees/<name>/` | Feature checkouts |
+| `omarchy-iso/release/` | Downloaded ISOs |
+| `omarchy-iso/test-runs/` | Base images, run disks, logs, and `CURRENT` ISO selection |
+
+Nested checkouts and VM files are Git-ignored. Keep checkouts here as real directories.
+
+`mise health` checks tools and artifacts. `mise rebase status` shows selection. Both are read-only. For a missing selected ISO, rebase to an available target.
+
+Setup and test apply [the harness patch](patches/omarchy-iso-test.patch) when compatible. On conflict, they stop and preserve local contents. Follow the [refresh instructions](AGENTS.md#harness-patch) to reconcile changes. Regenerating from an unmodified harness does not repair a conflict.
+
+## Check the wrappers
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+These checks require Python 3 and setup's host tools. They use temporary repositories and small qcow2 files without booting a VM. Harness cases are skipped without a local `omarchy-iso` checkout. Use `mise test --run-tests [tree]` for live guest checks.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+[MIT](LICENSE).
