@@ -4,9 +4,9 @@ Run stock [Omarchy](https://omarchy.org) or a feature checkout in a disposable V
 
 ## Requirements
 
-Use an x86_64 Omarchy host with KVM access, Git, and **mise 2026.10.19 or newer**. At least 20 GiB of free space is recommended.
+Use an x86_64 Omarchy host with **mise 2026.10.19 or newer**. At least 20 GiB of free space is recommended.
 
-Setup needs network access and installs the host packages in [mise.toml](mise.toml), including QEMU and UEFI firmware.
+`mise setup` installs the required host packages from [mise.toml](mise.toml), including QEMU and UEFI firmware. Initial setup needs network access.
 
 ## Quick start
 
