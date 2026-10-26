@@ -1,5 +1,5 @@
 # Omarchy feature-dev workspace.
-# Happy path: mise setup → mise test [tree] → mise rebase when needed.
+# Quick start: mise setup → mise worktree → mise test [tree] → mise rebase when needed.
 # Wrappers on PATH via [env] when you cd here (Omarchy activates mise).
 
 min_version = "2025.8.0"
@@ -36,10 +36,10 @@ script = 'complete -p mise &>/dev/null || eval "$(command mise completion bash)"
 "pacman:curl" = "latest"
 
 [tasks.setup]
-description = "Prepare workspace (packages, clones, ISO, acceptance base)"
+description = "Prepare workspace (packages, clones, ISO, base image)"
 usage = '''
 flag "--no-iso" help="Skip ISO download"
-flag "--no-base" help="Skip acceptance base"
+flag "--no-base" help="Skip base image"
 flag "--no-packages" help="Skip mise bootstrap packages apply"
 flag "--channel <channel>" help="ISO channel" default="edge" {
   choices "edge" "stable"
@@ -81,7 +81,7 @@ exec bin/omarchy-dev-test "${args[@]}"
 '''
 
 [tasks.rebase]
-description = "Rebuild shared acceptance base (default: latest edge ISO)"
+description = "Rebuild shared base image (default: latest edge ISO)"
 usage = '''
 arg "[cmd]" help="list (pick ISO) | status (show active base) | omit for edge" {
   choices "list" "status"
@@ -91,4 +91,22 @@ run = '''
 #!/usr/bin/env bash
 set -euo pipefail
 exec bin/omarchy-dev-rebase ${usage_cmd:+"$usage_cmd"}
+'''
+
+[tasks.worktree]
+description = "Manage feature worktrees under worktrees/"
+usage = '''
+arg "<action>" help="list | add | remove" {
+  choices "list" "add" "remove"
+}
+arg "[name]" help="Worktree name (add / remove)"
+arg "[start]" help="Start point for add (default: quattro)"
+'''
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+args=("$usage_action")
+[[ -n ${usage_name:-} ]] && args+=("$usage_name")
+[[ -n ${usage_start:-} ]] && args+=("$usage_start")
+exec bin/omarchy-dev-worktree "${args[@]}"
 '''
