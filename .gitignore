@@ -8,6 +8,9 @@ worktrees/
 vms/**
 !vms/.gitkeep
 
+# Local review artifacts
+.audit/
+
 # Host-local keyboard choice for --grab-kbd (path under /dev/input/by-id)
 .grab-kbd
 
@@ -15,3 +18,4 @@ vms/**
 *~
 .DS_Store
 *.swp
+__pycache__/

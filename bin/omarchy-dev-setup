@@ -1,5 +1,5 @@
 #!/bin/bash
-# Prepare the workspace: packages, clones, ISO, acceptance base.
+# Prepare the workspace: packages, clones, ISO, base image.
 set -euo pipefail
 
 SCRIPT_DIR="$(CDPATH= builtin cd -- "$(dirname "$0")" && builtin pwd)"
@@ -25,12 +25,12 @@ Usage: omarchy-dev-setup [options]
     3. clone omarchy/ when missing
     4. clone omarchy-iso/ when missing
     5. download channel ISO (unless skipped)
-    6. ensure acceptance base (unless skipped)
+    6. ensure base image (unless skipped)
 
 Options:
   --channel edge|stable   ISO channel (default: edge)
   --no-iso                Skip ISO download
-  --no-base               Skip acceptance base
+  --no-base               Skip base image
   --no-packages           Skip mise bootstrap packages apply
   -h, --help              Show this help
 EOF
@@ -87,30 +87,29 @@ else
   echo "==> omarchy checkout present: $OMARCHY_DEV_OMARCHY"
 fi
 
-fetch_args=(--channel "$CHANNEL")
-$FETCH_ISO && fetch_args+=(--iso)
+if [[ -L $OMARCHY_DEV_ISO ]]; then
+  omarchy_dev_die "$OMARCHY_DEV_ISO is a symlink; use a real clone inside omarchy-dev"
+fi
+if [[ ! -d $OMARCHY_DEV_ISO/.git ]]; then
+  [[ ! -e $OMARCHY_DEV_ISO ]] || omarchy_dev_die "$OMARCHY_DEV_ISO exists but is not a git checkout"
+  echo "==> Cloning omarchy-iso → $OMARCHY_DEV_ISO"
+  git clone "$ISO_REMOTE" "$OMARCHY_DEV_ISO"
+fi
+mkdir -p "$OMARCHY_DEV_ISO/release"
+omarchy_dev_ensure_iso_harness_patch
 
+iso=
 if $FETCH_ISO; then
-  if meta_hint=$(curl -fsSL "$(omarchy_dev_channel_url "$CHANNEL")" 2>/dev/null); then
-    need=$(jq -r '.size // 0' <<<"$meta_hint")
-    if ((need > 0)); then
-      avail=$(df -B1 --output=avail "$OMARCHY_DEV_ROOT" | tail -n1)
-      echo "==> ISO ≈ $((need / 1024 / 1024 / 1024)) GiB; free on volume ≈ $((avail / 1024 / 1024 / 1024)) GiB"
-      if ((avail < need + 2 * 1024 * 1024 * 1024)); then
-        omarchy_dev_die "Not enough free disk (need ~$((need / 1024 / 1024 / 1024)) GiB + 2 GiB headroom)"
-      fi
-    fi
-  fi
+  iso=$(omarchy_dev_ensure_channel_iso "$CHANNEL")
+elif $BUILD_BASE; then
+  iso=$(omarchy_dev_current_iso) || omarchy_dev_die "No selected or local ISO; run: mise setup"
 fi
 
-echo "==> Layout + artifacts"
-ISO_REMOTE=$ISO_REMOTE "$SCRIPT_DIR/_omarchy-dev-fetch" "${fetch_args[@]}"
-
 if $BUILD_BASE; then
-  echo "==> Acceptance base"
-  omarchy_dev_ensure_base
+  echo "==> Base image"
+  omarchy_dev_ensure_base "$iso"
 else
-  echo "==> Skipping acceptance base (--no-base)"
+  echo "==> Skipping base image (--no-base)"
 fi
 
 echo

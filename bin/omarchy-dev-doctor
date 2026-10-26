@@ -1,0 +1,186 @@
+#!/bin/bash
+# Read-only readiness check for this workspace.
+set -euo pipefail
+
+SCRIPT_DIR="$(CDPATH= builtin cd -- "$(dirname "$0")" && builtin pwd)"
+# shellcheck source=./_lib.sh
+source "$SCRIPT_DIR/_lib.sh"
+
+case "${1:-}" in
+  -h | --help)
+    cat <<'EOF'
+Usage: omarchy-dev-doctor
+
+  Read-only check: host tools, clones, harness patch, ISO, base image.
+  Exit 0 if all required checks pass; 1 otherwise.
+
+  mise health
+EOF
+    exit 0
+    ;;
+esac
+
+pass=0
+warn=0
+fail=0
+
+check() {
+  local status=$1
+  shift
+  case "$status" in
+    ok)
+      printf '  ok   %s\n' "$*"
+      pass=$((pass + 1))
+      ;;
+    warn)
+      printf '  warn %s\n' "$*"
+      warn=$((warn + 1))
+      ;;
+    fail)
+      printf '  fail %s\n' "$*"
+      fail=$((fail + 1))
+      ;;
+    *)
+      omarchy_dev_die "doctor: bad status $status"
+      ;;
+  esac
+}
+
+need_cmd() {
+  local cmd=$1
+  if command -v "$cmd" >/dev/null 2>&1; then
+    check ok "$cmd"
+  else
+    check fail "$cmd missing"
+  fi
+}
+
+echo "omarchy-dev doctor  ($OMARCHY_DEV_ROOT)"
+echo
+
+echo "Host"
+arch=$(uname -m)
+if [[ $arch == x86_64 || $arch == amd64 ]]; then
+  check ok "arch $arch"
+else
+  check warn "arch $arch (harness targets x86_64)"
+fi
+
+if [[ -r /dev/kvm && -w /dev/kvm ]]; then
+  check ok "/dev/kvm (rw)"
+else
+  check fail "/dev/kvm not usable"
+fi
+
+need_cmd qemu-system-x86_64
+need_cmd qemu-img
+need_cmd ssh
+need_cmd tar
+need_cmd jq
+need_cmd curl
+need_cmd socat
+need_cmd tesseract
+
+if [[ -e /usr/share/edk2/x64/OVMF_CODE.4m.fd || -e /usr/share/edk2-ovmf/x64/OVMF_CODE.4m.fd ]]; then
+  check ok "OVMF firmware"
+else
+  check fail "OVMF firmware missing (edk2-ovmf)"
+fi
+
+if command -v gum >/dev/null 2>&1; then
+  check ok "gum"
+else
+  check warn "gum missing (optional; mise rebase list / keyboard picker)"
+fi
+
+avail_b=$(df -B1 --output=avail "$OMARCHY_DEV_ROOT" 2>/dev/null | tail -n1 | tr -d ' ')
+if [[ ${avail_b:-0} =~ ^[0-9]+$ ]]; then
+  avail_g=$((avail_b / 1024 / 1024 / 1024))
+  if ((avail_b < 8 * 1024 * 1024 * 1024)); then
+    check fail "free disk ${avail_g}G (need ≥8G)"
+  elif ((avail_b < 20 * 1024 * 1024 * 1024)); then
+    check warn "free disk ${avail_g}G (recommend ≥20G for ISO + base)"
+  else
+    check ok "free disk ${avail_g}G"
+  fi
+else
+  check warn "could not read free disk for $OMARCHY_DEV_ROOT"
+fi
+
+echo
+echo "Workspace"
+
+if command -v mise >/dev/null 2>&1; then
+  check ok "mise"
+else
+  check fail "mise missing"
+fi
+
+if [[ -d $OMARCHY_DEV_OMARCHY/.git || -f $OMARCHY_DEV_OMARCHY/.git ]]; then
+  ref=$(git -C "$OMARCHY_DEV_OMARCHY" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
+  short=$(git -C "$OMARCHY_DEV_OMARCHY" rev-parse --short HEAD 2>/dev/null || echo "?")
+  check ok "omarchy/ ($ref @ $short)"
+else
+  check fail "omarchy/ missing — run: mise setup"
+fi
+
+if [[ -x $OMARCHY_DEV_ISO/bin/omarchy-iso-test ]]; then
+  check ok "omarchy-iso/ (harness present)"
+else
+  check fail "omarchy-iso/ missing or incomplete — run: mise setup"
+fi
+
+if [[ -f $OMARCHY_DEV_ISO_HARNESS_PATCH ]]; then
+  check ok "patches/omarchy-iso-test.patch"
+else
+  check fail "patches/omarchy-iso-test.patch missing"
+fi
+
+if [[ -x $OMARCHY_DEV_ISO/bin/omarchy-iso-test ]]; then
+  if omarchy_dev_harness_is_patched; then
+    check ok "harness patch applied"
+  else
+    check fail "harness not patched — run: mise setup (or any mise test)"
+  fi
+fi
+
+if [[ -d $OMARCHY_DEV_WORKTREES ]]; then
+  mapfile -t trees < <(find "$OMARCHY_DEV_WORKTREES" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort)
+  if ((${#trees[@]})); then
+    check ok "worktrees/ (${#trees[@]}: ${trees[*]})"
+  else
+    check ok "worktrees/ (empty)"
+  fi
+else
+  check warn "worktrees/ missing"
+fi
+
+echo
+echo "Artifacts"
+
+iso=
+if iso=$(omarchy_dev_current_iso); then
+  check ok "ISO  $(basename "$iso")"
+  disk=$(omarchy_dev_base_disk_for_iso "$iso")
+  if omarchy_dev_base_is_usable "$iso"; then
+    bytes=$(stat -c%s "$disk" 2>/dev/null || echo 0)
+    check ok "base $(basename "$(dirname "$disk")")/base.qcow2 ($((bytes / 1024 / 1024 / 1024))G)"
+  else
+    check fail "base missing or incomplete — run: mise rebase"
+  fi
+else
+  check fail "no valid ISO selection — run: mise setup or mise rebase <target>"
+  check fail "no base — run: mise rebase"
+fi
+
+echo
+if ((fail > 0)); then
+  echo "$fail required check(s) failed."
+  exit 1
+fi
+if ((warn > 0)); then
+  echo "All required checks passed ($warn warning(s))."
+else
+  echo "All required checks passed."
+fi
+exit 0

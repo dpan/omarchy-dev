@@ -50,7 +50,7 @@ case "$cmd" in
       git -C "$OMARCHY_DEV_OMARCHY" worktree add -b "$branch" "$dest" "$start"
     fi
     echo "Tree: $dest"
-    echo "Test: mise test -- $name"
+    echo "Test: mise test $name"
     ;;
   remove | rm)
     name=${1:-}

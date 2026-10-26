@@ -46,46 +46,41 @@ omarchy_dev_require_iso_repo() {
     omarchy_dev_die "omarchy-iso missing or incomplete at $OMARCHY_DEV_ISO — run: mise setup"
 }
 
-# Build a standalone git checkout of a tree (incl. worktrees) for guest sync.
-# iso-test's --sync-all strips .git; we pass this dir instead so the guest gets
-# a real repo (update-dev, etc.). Overlays the working tree so dirty files win.
-omarchy_dev_materialize_sync_tree() {
-  local src=$1
-  local dest=${2:-$OMARCHY_DEV_ISO/test-runs/.sync-tree}
-  local url branch
+# Copy source contents with independent Git metadata for guest sync.
+omarchy_dev_materialize_sync_tree() (
+  set -euo pipefail
+  local src=$1 dest=${2:-} url
 
   [[ -d $src ]] || omarchy_dev_die "materialize: not a directory: $src"
+  src=$(omarchy_dev_abs "$src") || return 1
   git -C "$src" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
     omarchy_dev_die "materialize: not a git checkout: $src"
 
-  rm -rf "$dest"
-  mkdir -p "$(dirname "$dest")"
-
-  # Full object copy (worktree .git is a gitdir pointer — useless inside the guest).
-  git clone --no-hardlinks "$src" "$dest" ||
-    omarchy_dev_die "materialize: git clone failed from $src"
-
-  # Match the worktree's dirty/uncommitted files on top of the clone.
-  tar -C "$src" --exclude .git -cf - . | tar -C "$dest" -xf -
-
-  branch=$(git -C "$src" branch --show-current 2>/dev/null || true)
-  if [[ -n $branch ]]; then
-    git -C "$dest" checkout -B "$branch" >/dev/null 2>&1 || true
+  if [[ -z $dest ]]; then
+    mkdir -p "$OMARCHY_DEV_ISO/test-runs" || return 1
+    dest=$(mktemp -d "$OMARCHY_DEV_ISO/test-runs/.sync-tree.XXXXXX") || return 1
+  else
+    dest=$(realpath -m -- "$dest") || return 1
+    [[ $src != "$dest" && $src != "$dest/"* && $dest != "$src/"* ]] ||
+      omarchy_dev_die "materialize: destination overlaps source: $dest"
+    rm -rf -- "$dest" || return 1
+    mkdir -p "$(dirname "$dest")" || return 1
   fi
+  trap 'rm -rf -- "$dest"' EXIT
+
+  git clone --no-checkout --no-local "$src" "$dest" >&2 || return 1
+  git -C "$dest" read-tree HEAD || return 1
+  tar -C "$src" --exclude=./.git -cf - . | tar -C "$dest" -xf - || return 1
 
   if url=$(git -C "$src" remote get-url origin 2>/dev/null); then
-    git -C "$dest" remote set-url origin "$url" 2>/dev/null ||
-      git -C "$dest" remote add origin "$url"
+    git -C "$dest" remote set-url origin "$url" || return 1
   fi
-
-  # Drop upstream tracking if it points at something the guest can't fetch yet;
-  # update-dev skips cleanly when there is no upstream (still a valid checkout).
   git -C "$dest" branch --unset-upstream >/dev/null 2>&1 || true
 
+  trap - EXIT
   printf '%s\n' "$dest"
-}
+)
 
-# Pointer to the ISO basename (e.g. omarchy-edge-….iso) whose base sync/test use.
 OMARCHY_DEV_CURRENT_ISO_FILE="${OMARCHY_DEV_CURRENT_ISO_FILE:-$OMARCHY_DEV_ISO/test-runs/CURRENT}"
 
 # Newest ISO under omarchy-iso/release/ (mtime). Prints path; returns 1 if none.
@@ -104,69 +99,82 @@ omarchy_dev_find_latest_iso() {
   printf '%s\n' "$latest"
 }
 
-omarchy_dev_latest_iso() {
-  local latest
-  latest=$(omarchy_dev_find_latest_iso) ||
-    omarchy_dev_die "No ISO in $OMARCHY_DEV_ISO/release — run: mise setup"
-  printf '%s\n' "$latest"
-}
-
 # Default-options base disk path for an ISO (matches omarchy-iso-test BASE_NAME).
 omarchy_dev_base_disk_for_iso() {
   local iso=$1
   printf '%s\n' "$OMARCHY_DEV_ISO/test-runs/$(basename "$iso" .iso)/base.qcow2"
 }
 
-# True if disk looks like a finished install (empty qemu-img create is ~200KiB).
+omarchy_dev_base_fingerprint() {
+  local iso=$1 disk=$2
+  printf 'omarchy-dev-base-v1\n%s\n' "$iso"
+  stat -c '%d:%i:%s:%y:%z' -- "$iso" "$disk"
+}
+
+omarchy_dev_base_files_are_valid() {
+  local disk=$1 info
+  [[ -r ${disk%/*}/OVMF_VARS.4m.fd && -s ${disk%/*}/OVMF_VARS.4m.fd &&
+    -r ${disk%/*}/id_ed25519 && -s ${disk%/*}/id_ed25519 ]] || return 1
+  info=$(qemu-img info --output=json "$disk" 2>/dev/null) || return 1
+  jq -e '.format == "qcow2" and (has("backing-filename") | not)' <<<"$info" >/dev/null
+}
+
 omarchy_dev_base_is_usable() {
-  local disk=$1 bytes
-  [[ -f $disk ]] || return 1
-  bytes=$(stat -c%s "$disk" 2>/dev/null) || return 1
-  ((bytes >= 1024 * 1024 * 1024))
+  local iso disk marker expected
+  iso=$(realpath -e -- "$1") || return 1
+  disk=$(omarchy_dev_base_disk_for_iso "$iso")
+  marker=${disk%/*}/base.complete
+  [[ -f $iso && -f $disk && -f $marker ]] || return 1
+  expected=$(omarchy_dev_base_fingerprint "$iso" "$disk") || return 1
+  [[ $(<"$marker") == "$expected" ]] || return 1
+  omarchy_dev_base_files_are_valid "$disk"
 }
 
 omarchy_dev_set_current_iso() {
-  local iso=$1 name
-  name=$(basename "$iso")
-  mkdir -p "$(dirname "$OMARCHY_DEV_CURRENT_ISO_FILE")"
-  printf '%s\n' "$name" >"$OMARCHY_DEV_CURRENT_ISO_FILE"
+  local iso temp
+  iso=$(realpath -e -- "$1") || return 1
+  [[ -f $iso ]] || return 1
+  mkdir -p "$(dirname "$OMARCHY_DEV_CURRENT_ISO_FILE")" || return 1
+  temp=$(mktemp "$OMARCHY_DEV_CURRENT_ISO_FILE.XXXXXX") || return 1
+  if ! printf '%s\n' "$iso" >"$temp" || ! mv -fT -- "$temp" "$OMARCHY_DEV_CURRENT_ISO_FILE"; then
+    rm -f -- "$temp"
+    return 1
+  fi
 }
 
-# ISO path for the active acceptance base (CURRENT file, else newest usable, else latest file).
+# CURRENT is authoritative when present. Discovery never changes selection.
 omarchy_dev_current_iso() {
-  local name iso disk dir base latest_usable="" f
+  local selection iso disk latest_disk= latest_iso=
 
-  if [[ -f $OMARCHY_DEV_CURRENT_ISO_FILE ]]; then
-    name=$(<"$OMARCHY_DEV_CURRENT_ISO_FILE")
-    iso=$OMARCHY_DEV_ISO/release/$name
-    disk=$(omarchy_dev_base_disk_for_iso "$iso")
-    if [[ -f $iso ]] && omarchy_dev_base_is_usable "$disk"; then
-      printf '%s\n' "$iso"
-      return 0
-    fi
+  if [[ -e $OMARCHY_DEV_CURRENT_ISO_FILE || -L $OMARCHY_DEV_CURRENT_ISO_FILE ]]; then
+    [[ -f $OMARCHY_DEV_CURRENT_ISO_FILE && -r $OMARCHY_DEV_CURRENT_ISO_FILE ]] ||
+      omarchy_dev_die "Invalid CURRENT selection at $OMARCHY_DEV_CURRENT_ISO_FILE"
+    selection=$(<"$OMARCHY_DEV_CURRENT_ISO_FILE")
+    case "$selection" in
+      /*) iso=$selection ;;
+      '' | */*) omarchy_dev_die "Invalid CURRENT selection at $OMARCHY_DEV_CURRENT_ISO_FILE" ;;
+      *) iso=$OMARCHY_DEV_ISO/release/$selection ;;
+    esac
+    [[ -f $iso ]] || omarchy_dev_die "Selected ISO is missing: $iso (run: mise rebase <target>)"
+    realpath -e -- "$iso"
+    return
   fi
 
-  shopt -s nullglob
-  for disk in "$OMARCHY_DEV_ISO"/test-runs/*/base.qcow2; do
-    omarchy_dev_base_is_usable "$disk" || continue
-    dir=$(dirname "$disk")
-    base=$(basename "$dir")
-    iso=$OMARCHY_DEV_ISO/release/$base.iso
+  for iso in "$OMARCHY_DEV_ISO"/release/*.iso; do
     [[ -f $iso ]] || continue
-    if [[ -z $latest_usable || $disk -nt $latest_usable ]]; then
-      latest_usable=$disk
-      f=$iso
+    omarchy_dev_base_is_usable "$iso" || continue
+    disk=$(omarchy_dev_base_disk_for_iso "$iso")
+    if [[ -z $latest_disk || $disk -nt $latest_disk ]]; then
+      latest_disk=$disk
+      latest_iso=$iso
     fi
   done
-  shopt -u nullglob
-
-  if [[ -n ${f:-} ]]; then
-    omarchy_dev_set_current_iso "$f"
-    printf '%s\n' "$f"
-    return 0
+  if [[ -n $latest_iso ]]; then
+    realpath -e -- "$latest_iso"
+  else
+    iso=$(omarchy_dev_find_latest_iso) || return 1
+    realpath -e -- "$iso"
   fi
-
-  omarchy_dev_find_latest_iso
 }
 
 omarchy_dev_guess_channel() {
@@ -182,15 +190,16 @@ omarchy_dev_guess_channel() {
 # Print active ISO + base (for humans / mise rebase status).
 omarchy_dev_rebase_status() {
   local iso name disk bytes mtime channel state
-  if ! iso=$(omarchy_dev_current_iso 2>/dev/null); then
-    echo "No acceptance base yet. Run: mise rebase    # edge"
-    echo "Or pick one:              mise rebase list"
+  if ! iso=$(omarchy_dev_current_iso); then
+    [[ ! -e $OMARCHY_DEV_CURRENT_ISO_FILE && ! -L $OMARCHY_DEV_CURRENT_ISO_FILE ]] || return 1
+    echo "No base image yet. Run: mise rebase"
+    echo "Or: mise rebase list   # then: mise rebase <target>"
     return 0
   fi
   name=$(basename "$iso")
   disk=$(omarchy_dev_base_disk_for_iso "$iso")
   channel=$(omarchy_dev_guess_channel "$name")
-  if omarchy_dev_base_is_usable "$disk"; then
+  if omarchy_dev_base_is_usable "$iso"; then
     state=usable
   elif [[ -f $disk ]]; then
     state="incomplete ($(stat -c%s "$disk") bytes)"
@@ -200,7 +209,7 @@ omarchy_dev_rebase_status() {
   bytes=$(stat -c%s "$disk" 2>/dev/null || echo 0)
   mtime=$(stat -c%y "$disk" 2>/dev/null | cut -d. -f1 || echo unknown)
   cat <<EOF
-Acceptance base (shared by stock + all worktrees)
+Base image (shared by stock + all worktrees)
   ISO:     $name
   Channel: $channel
   Path:    $iso
@@ -211,35 +220,37 @@ Acceptance base (shared by stock + all worktrees)
 EOF
 }
 
-# Download url → dest atomically (*.partial then rename). Re-verify if dest exists.
-omarchy_dev_fetch_file() {
-  local url=$1 dest=$2
-  local sum_url=$3
-  local dir base partial
-
-  dir=$(dirname "$dest")
-  base=$(basename "$dest")
-  partial=$dest.partial
-  mkdir -p "$dir"
+# Verify downloads before replacing any existing ISO or checksum.
+omarchy_dev_fetch_file() (
+  set -euo pipefail
+  local url=$1 dest=$2 sum_url=$3 partial sum_file expected actual
+  mkdir -p "$(dirname "$dest")" || return 1
+  partial=$(mktemp "$dest.partial.XXXXXX") || return 1
+  sum_file=
+  trap 'rm -f -- "$partial" "$sum_file"' EXIT
+  sum_file=$(mktemp "$dest.sha256.XXXXXX") || return 1
+  curl -fsSL -o "$sum_file" "$sum_url" || return 1
+  read -r expected _ <"$sum_file" || [[ -n $expected ]] || return 1
+  [[ $expected =~ ^[[:xdigit:]]{64}$ ]] || omarchy_dev_die "Invalid SHA256 checksum from $sum_url"
+  expected=${expected,,}
 
   if [[ -f $dest ]]; then
-    if [[ -f $dest.sha256 ]] || curl -fsSL -o "$dest.sha256" "$sum_url"; then
-      if (CDPATH= builtin cd -- "$dir" && sha256sum -c "$base.sha256") >/dev/null 2>&1; then
-        echo "Already present (checksum OK): $dest"
-        return 0
-      fi
-      echo "Checksum mismatch for $dest — re-downloading"
-      rm -f "$dest"
+    actual=$(sha256sum -- "$dest") || return 1
+    if [[ ${actual%% *} == "$expected" ]]; then
+      echo "Already present (checksum OK): $dest" >&2
+      mv -fT -- "$sum_file" "$dest.sha256" || return 1
+      return 0
     fi
+    echo "Checksum mismatch for $dest; downloading replacement" >&2
   fi
 
-  echo "Downloading → $dest"
-  rm -f "$partial"
-  curl -fL --progress-bar -o "$partial" "$url"
-  curl -fsSL -o "$dest.sha256" "$sum_url"
-  mv -f "$partial" "$dest"
-  (CDPATH= builtin cd -- "$dir" && sha256sum -c "$base.sha256")
-}
+  echo "Downloading $dest" >&2
+  curl -fL --progress-bar -o "$partial" "$url" || return 1
+  actual=$(sha256sum -- "$partial") || return 1
+  [[ ${actual%% *} == "$expected" ]] || omarchy_dev_die "Checksum mismatch for download: $url"
+  mv -fT -- "$partial" "$dest" || return 1
+  mv -fT -- "$sum_file" "$dest.sha256" || return 1
+)
 
 omarchy_dev_channel_url() {
   case "${1:-edge}" in
@@ -251,18 +262,26 @@ omarchy_dev_channel_url() {
 
 # Ensure channel ISO is in release/; print its path. Channels: edge | stable.
 omarchy_dev_ensure_channel_iso() {
-  local channel=${1:-edge} meta iso_url iso_name dest
+  local channel=${1:-edge} meta iso_url iso_name dest meta_url need avail
   command -v jq >/dev/null || omarchy_dev_die "jq is required"
   command -v curl >/dev/null || omarchy_dev_die "curl is required"
   omarchy_dev_require_iso_repo
   mkdir -p "$OMARCHY_DEV_ISO/release"
-  meta=$(curl -fsSL "$(omarchy_dev_channel_url "$channel")")
-  iso_url=$(jq -r .url <<<"$meta")
+  meta_url=$(omarchy_dev_channel_url "$channel") || return 1
+  meta=$(curl -fsSL "$meta_url") || return 1
+  iso_url=$(jq -er '.url | select(type == "string" and length > 0)' <<<"$meta") || return 1
   iso_name=${iso_url##*/}
   dest=$OMARCHY_DEV_ISO/release/$iso_name
+  need=$(jq -r '.size // 0' <<<"$meta") || return 1
+  if [[ $need =~ ^[0-9]+$ ]] && ((need > 0)); then
+    avail=$(df -B1 --output=avail "$OMARCHY_DEV_ISO/release" | tail -n1) || return 1
+    [[ $avail =~ ^[[:space:]]*[0-9]+[[:space:]]*$ ]] || omarchy_dev_die "Could not read available disk space"
+    ((avail >= need + 2 * 1024 * 1024 * 1024)) ||
+      omarchy_dev_die "Not enough free disk for ISO download and 2 GiB headroom"
+  fi
   echo "Channel $channel → $(jq -r .version <<<"$meta") ($iso_name)" >&2
-  omarchy_dev_fetch_file "$iso_url" "$dest" "$iso_url.sha256"
-  printf '%s\n' "$dest"
+  omarchy_dev_fetch_file "$iso_url" "$dest" "$iso_url.sha256" || return 1
+  realpath -e -- "$dest"
 }
 
 # Fetch a release/RC ISO from iso.omarchy.org (or any URL) into release/.
@@ -272,14 +291,14 @@ omarchy_dev_ensure_iso_url() {
   dest=$OMARCHY_DEV_ISO/release/$name
   omarchy_dev_require_iso_repo
   mkdir -p "$OMARCHY_DEV_ISO/release"
-  omarchy_dev_fetch_file "$url" "$dest" "$url.sha256"
-  printf '%s\n' "$dest"
+  omarchy_dev_fetch_file "$url" "$dest" "$url.sha256" || return 1
+  realpath -e -- "$dest"
 }
 
 # Lines: kind<TAB>version<TAB>url<TAB>local_path_or_-
 # kind is edge|stable|rc|local
 omarchy_dev_list_iso_candidates() {
-  local meta url name ver dest local_path seen="" f
+  local meta url name ver dest local_path seen="" f channel rels
   command -v jq >/dev/null || omarchy_dev_die "jq is required"
   command -v curl >/dev/null || omarchy_dev_die "curl is required"
 
@@ -332,88 +351,174 @@ omarchy_dev_list_iso_candidates() {
   shopt -u nullglob
 }
 
-# Always (re)build the acceptance base via omarchy-iso-test --install-only.
+# Publish completion and selection only after a successful, validated install.
 omarchy_dev_build_base() {
-  local iso=${1:-}
-  omarchy_dev_require_iso_repo
-  [[ -n $iso ]] || iso=$(omarchy_dev_latest_iso)
+  local iso disk marker temp
+  [[ -n ${1:-} ]] || omarchy_dev_die "build_base requires an explicit ISO"
+  iso=$(realpath -e -- "$1") || return 1
   [[ -f $iso ]] || omarchy_dev_die "ISO not found: $iso"
+  omarchy_dev_require_iso_repo
+  disk=$(omarchy_dev_base_disk_for_iso "$iso")
+  marker=${disk%/*}/base.complete
+  rm -f -- "$marker" || return 1
 
-  echo "Building acceptance base from $(basename "$iso")" >&2
-  builtin cd "$OMARCHY_DEV_ISO"
-  ./bin/omarchy-iso-test "$iso" --install-only --no-preview
+  echo "Building base image from $(basename "$iso")" >&2
+  (builtin cd "$OMARCHY_DEV_ISO" && ./bin/omarchy-iso-test "$iso" --install-only --no-preview) || return
+  omarchy_dev_base_files_are_valid "$disk" || {
+    echo "Invalid base image or missing firmware/SSH key beside $disk" >&2
+    return 1
+  }
+  qemu-img check -f qcow2 "$disk" >&2 || return 1
+  temp=$(mktemp "$marker.XXXXXX") || return 1
+  if ! omarchy_dev_base_fingerprint "$iso" "$disk" >"$temp" || ! mv -fT -- "$temp" "$marker"; then
+    rm -f -- "$temp"
+    return 1
+  fi
   omarchy_dev_set_current_iso "$iso"
 }
 
-# Fetch latest edge ISO and force-rebuild base (default `mise rebase`).
-omarchy_dev_rebase_edge() {
-  local iso
-  iso=$(omarchy_dev_ensure_channel_iso edge)
-  omarchy_dev_build_base "$iso"
+# Resolve a candidate row (kind, ver, url, local_path) to a local ISO path.
+omarchy_dev_iso_from_candidate() {
+  local kind=$1 ver=$2 url=$3 local_path=$4
+  if [[ $local_path != - && -f $local_path ]]; then
+    realpath -e -- "$local_path"
+    return
+  fi
+  if [[ $url == file://* ]]; then
+    realpath -e -- "${url#file://}"
+    return
+  fi
+  if [[ -n $url && $url != - ]]; then
+    omarchy_dev_ensure_iso_url "$url"
+    return
+  fi
+  omarchy_dev_die "No path/URL for ISO candidate: $kind $ver"
 }
 
-# Interactive pick from omarchy_dev_list_iso_candidates, then fetch + rebuild.
+# Print available ISOs (no rebuild). Columns: KIND VERSION WHERE NAME
 omarchy_dev_rebase_list() {
-  local -a labels=() urls=()
-  local kind ver url local_path label pick idx iso line
+  local kind ver url local_path where name
+  local any=false
 
+  printf '%-7s %-28s %-6s %s\n' KIND VERSION WHERE FILE
   while IFS=$'\t' read -r kind ver url local_path; do
     [[ -n $kind ]] || continue
+    any=true
     if [[ $local_path != - ]]; then
-      label=$(printf '%-7s %-22s local' "$kind" "$ver")
+      where=local
+      name=$(basename "$local_path")
     else
-      label=$(printf '%-7s %-22s remote' "$kind" "$ver")
+      where=remote
+      name=${url##*/}
     fi
-    labels+=("$label")
-    if [[ $url != - ]]; then
-      urls+=("$url")
-    else
-      urls+=("file://$local_path")
+    printf '%-7s %-28s %-6s %s\n' "$kind" "$ver" "$where" "$name"
+  done < <(omarchy_dev_list_iso_candidates)
+
+  $any || omarchy_dev_die "No ISOs found (network or omarchy-iso/release/)"
+}
+
+# Resolve target → ISO path: edge|stable, version, basename, or filesystem path.
+omarchy_dev_resolve_rebase_target() {
+  local target=$1 kind ver url local_path name row best=
+  local -a matches=()
+  [[ -n $target ]] || omarchy_dev_die "empty rebase target"
+  if [[ -f $target ]]; then
+    realpath -e -- "$target"
+    return
+  fi
+  case "$target" in
+    edge | stable)
+      omarchy_dev_ensure_channel_iso "$target"
+      return
+      ;;
+    rc)
+      while IFS= read -r row; do
+        [[ $row == rc$'\t'* ]] && matches+=("$row")
+      done < <(omarchy_dev_list_iso_candidates)
+      ((${#matches[@]})) || omarchy_dev_die "No rc ISOs found; try: mise rebase list"
+      best=$(printf '%s\n' "${matches[@]}" | sort -t $'\t' -k2,2V | tail -n1)
+      IFS=$'\t' read -r kind ver url local_path <<<"$best"
+      omarchy_dev_iso_from_candidate "$kind" "$ver" "$url" "$local_path"
+      return
+      ;;
+  esac
+
+  name=${target##*/}
+  name=${name%.iso}
+  while IFS= read -r row; do
+    IFS=$'\t' read -r kind ver url local_path <<<"$row"
+    [[ -n $kind ]] || continue
+    if [[ $ver == "$target" || $ver == "$name" || $kind/$ver == "$target" ||
+      ($local_path != - && (${local_path##*/} == "$target" || ${local_path##*/} == "$name.iso")) ||
+      ($local_path == - && (${url##*/} == "$target" || ${url##*/} == "$name.iso")) ]]; then
+      matches+=("$row")
     fi
   done < <(omarchy_dev_list_iso_candidates)
 
-  ((${#labels[@]})) || omarchy_dev_die "No ISOs found (network or omarchy-iso/release/)"
-
-  if ! command -v gum >/dev/null 2>&1; then
-    echo "Available ISOs (install gum for interactive select):"
-    printf '  %s\n' "${labels[@]}"
-    omarchy_dev_die "Re-run with gum installed, or: mise rebase   # edge"
+  ((${#matches[@]})) || omarchy_dev_die "No ISO matches '$target'; try: mise rebase list"
+  if ((${#matches[@]} > 1)); then
+    echo "Ambiguous target '$target' (matches ${#matches[@]}):" >&2
+    for row in "${matches[@]}"; do
+      IFS=$'\t' read -r kind ver url local_path <<<"$row"
+      echo "  $kind  $ver" >&2
+    done
+    omarchy_dev_die "Pick a unique version from: mise rebase list"
   fi
+  IFS=$'\t' read -r kind ver url local_path <<<"${matches[0]}"
+  omarchy_dev_iso_from_candidate "$kind" "$ver" "$url" "$local_path"
+}
 
-  pick=$(printf '%s\n' "${labels[@]}" | gum choose --header "ISO to rebase onto (shared base for stock + all worktrees)")
-  [[ -n $pick ]] || omarchy_dev_die "No ISO selected"
-
-  idx=-1
-  for i in "${!labels[@]}"; do
-    if [[ ${labels[$i]} == "$pick" ]]; then
-      idx=$i
-      break
+omarchy_dev_rebase_pick() {
+  local -a labels=() rows=()
+  local row kind ver url local_path label pick i iso
+  while IFS= read -r row; do
+    IFS=$'\t' read -r kind ver url local_path <<<"$row"
+    [[ -n $kind ]] || continue
+    if [[ $local_path != - ]]; then
+      label=$(printf '%-7s %-28s local  %s' "$kind" "$ver" "${local_path##*/}")
+    else
+      label=$(printf '%-7s %-28s remote %s' "$kind" "$ver" "${url##*/}")
     fi
+    labels+=("$label")
+    rows+=("$row")
+  done < <(omarchy_dev_list_iso_candidates)
+  ((${#rows[@]})) || omarchy_dev_die "No ISOs found (network or omarchy-iso/release/)"
+  command -v gum >/dev/null 2>&1 || omarchy_dev_die "Install gum, or: mise rebase <edge|stable|rc|version>"
+  pick=$(printf '%s\n' "${labels[@]}" | gum choose --header "ISO to rebase onto (shared base for stock + all worktrees)") || return 1
+  [[ -n $pick ]] || omarchy_dev_die "No ISO selected"
+  for i in "${!labels[@]}"; do
+    [[ ${labels[$i]} == "$pick" ]] || continue
+    IFS=$'\t' read -r kind ver url local_path <<<"${rows[$i]}"
+    iso=$(omarchy_dev_iso_from_candidate "$kind" "$ver" "$url" "$local_path") || return 1
+    omarchy_dev_build_base "$iso"
+    return
   done
-  ((idx >= 0)) || omarchy_dev_die "Internal select error"
+  omarchy_dev_die "Internal select error"
+}
 
-  url=${urls[$idx]}
-  if [[ $url == file://* ]]; then
-    iso=${url#file://}
-  else
-    iso=$(omarchy_dev_ensure_iso_url "$url")
+# Rebuild base from an explicit target (or interactive pick if empty).
+omarchy_dev_rebase() {
+  local target=${1:-} iso
+  if [[ -z $target ]]; then
+    omarchy_dev_rebase_pick
+    return
   fi
+  iso=$(omarchy_dev_resolve_rebase_target "$target") || return 1
   omarchy_dev_build_base "$iso"
 }
 
-# Build base only when missing or unusable (used by init). No-op if no ISO yet.
 omarchy_dev_ensure_base() {
   local iso disk
-  omarchy_dev_require_iso_repo
-  if ! iso=$(omarchy_dev_find_latest_iso); then
-    echo "Skipping acceptance base (no ISO in omarchy-iso/release/)" >&2
+  [[ -n ${1:-} ]] || omarchy_dev_die "ensure_base requires an explicit ISO"
+  iso=$(realpath -e -- "$1") || return 1
+  disk=$(omarchy_dev_base_disk_for_iso "$iso")
+  if omarchy_dev_base_is_usable "$iso"; then
+    omarchy_dev_set_current_iso "$iso" || return 1
+    echo "Base image ready: $disk" >&2
     return 0
   fi
-  disk=$(omarchy_dev_base_disk_for_iso "$iso")
-  if omarchy_dev_base_is_usable "$disk"; then
-    omarchy_dev_set_current_iso "$iso"
-    echo "Acceptance base ready: $disk" >&2
-    return 0
+  if [[ -e $disk ]]; then
+    omarchy_dev_die "Base image lacks valid completion evidence: $disk (run: mise rebase <target>)"
   fi
   omarchy_dev_build_base "$iso"
 }
@@ -422,13 +527,13 @@ omarchy_dev_ensure_base() {
 omarchy_dev_require_base() {
   local iso=${1:-} disk
   [[ -n $iso ]] || iso=$(omarchy_dev_current_iso) ||
-    omarchy_dev_die "No acceptance ISO/base — run: mise rebase    # or: mise rebase list"
+    omarchy_dev_die "No base image — run: mise rebase"
   disk=$(omarchy_dev_base_disk_for_iso "$iso")
-  if omarchy_dev_base_is_usable "$disk"; then
+  if omarchy_dev_base_is_usable "$iso"; then
     printf '%s\n' "$iso"
     return 0
   fi
-  omarchy_dev_die "No usable acceptance base at $disk — run: mise rebase    # or: mise rebase list"
+  omarchy_dev_die "No usable base image at $disk — run: mise rebase"
 }
 
 # Remembered keyboard for --grab-kbd (gitignored). Override with OMARCHY_DEV_GRAB_KBD.
@@ -493,8 +598,6 @@ omarchy_dev_acl_revoke_kbd() {
   sudo setfacl -x "u:${USER}" "$kbd" 2>/dev/null || true
 }
 
-# --- Shared VM session (test): display mode + optional keyboard grab ------
-
 OMARCHY_DEV_SESSION_MODE=graphical
 OMARCHY_DEV_SESSION_GRAB=true
 OMARCHY_DEV_SESSION_GRAB_PATH=
@@ -507,7 +610,6 @@ omarchy_dev_session_flags_help() {
   --graphical     Same as default window mode (explicit).
   --no-grab-kbd   Do not grab the host keyboard.
   --grab-kbd      Grab on (default; explicit).
-  --run-tests        Run automated checks (default is interactive desktop only).
                   Keyboard: OMARCHY_DEV_GRAB_KBD, else .grab-kbd, else sole
                   *-event-kbd, else gum. Temporary ACL. Starts ON.
                   Toggle host/guest: Left+Right Ctrl. Release grab for host Super.
@@ -535,10 +637,6 @@ omarchy_dev_session_parse_flags() {
       --no-grab-kbd)
         OMARCHY_DEV_SESSION_GRAB=false
         ;;
-      --run-tests)
-        # Handled by omarchy-dev-test; keep in REST so it still sees it.
-        OMARCHY_DEV_SESSION_REST+=("$1")
-        ;;
       --)
         shift
         # Keep the separator so callers (test → iso-test) still see it.
@@ -557,6 +655,10 @@ omarchy_dev_session_cleanup() {
   if [[ -n ${OMARCHY_DEV_SESSION_GRAB_PATH:-} ]]; then
     omarchy_dev_acl_revoke_kbd "$OMARCHY_DEV_SESSION_GRAB_PATH"
     OMARCHY_DEV_SESSION_GRAB_PATH=
+  fi
+  if [[ -n ${OMARCHY_DEV_SESSION_SYNC_TREE:-} ]]; then
+    rm -rf -- "$OMARCHY_DEV_SESSION_SYNC_TREE"
+    OMARCHY_DEV_SESSION_SYNC_TREE=
   fi
 }
 
@@ -583,11 +685,10 @@ omarchy_dev_session_prepare() {
   esac
 
   if $OMARCHY_DEV_SESSION_GRAB; then
-    OMARCHY_DEV_SESSION_GRAB_PATH=$(omarchy_dev_resolve_grab_keyboard)
+    OMARCHY_DEV_SESSION_GRAB_PATH=$(omarchy_dev_resolve_grab_keyboard) || return 1
     echo "$prefix: grabbing $OMARCHY_DEV_SESSION_GRAB_PATH (starts ON → guest)." >&2
     echo "$prefix: toggle host/guest: hold Left-Ctrl + Right-Ctrl, then release." >&2
-    omarchy_dev_acl_allow_kbd "$OMARCHY_DEV_SESSION_GRAB_PATH"
-    # grab_all=on: no second host keyboard/mouse sneaking into GTK → guest.
+    omarchy_dev_acl_allow_kbd "$OMARCHY_DEV_SESSION_GRAB_PATH" || return 1
     # repeat=off: avoid fighting the guest's own key repeat.
     extra+=" -object input-linux,id=omarchy-dev-kbd,evdev=$OMARCHY_DEV_SESSION_GRAB_PATH,grab_all=on,repeat=off,grab-toggle=ctrl-ctrl"
   fi
@@ -599,165 +700,25 @@ omarchy_dev_session_prepare() {
   export OMARCHY_ISO_QEMU_EXTRA="${OMARCHY_ISO_QEMU_EXTRA:+$OMARCHY_ISO_QEMU_EXTRA }$extra"
 }
 
-# Teach local omarchy-iso-test: QEMU_EXTRA + activate synced tree (idempotent).
-omarchy_dev_ensure_iso_qemu_extra_hook() {
-  local f=$OMARCHY_DEV_ISO/bin/omarchy-iso-test
-  [[ -f $f ]] || omarchy_dev_die "missing $f"
+# Tracked patch that extends local omarchy-iso-test (QEMU_EXTRA, activate sync,
+# interactive skip-tests, host-config). Refresh with:
+#   (cd omarchy-iso && git diff --src-prefix=a/ --dst-prefix=b/ HEAD -- bin/omarchy-iso-test) \
+#     > patches/omarchy-iso-test.patch
+OMARCHY_DEV_ISO_HARNESS_PATCH="${OMARCHY_DEV_ISO_HARNESS_PATCH:-$OMARCHY_DEV_ROOT/patches/omarchy-iso-test.patch}"
 
-  if ! grep -qF 'OMARCHY_ISO_QEMU_EXTRA' "$f"; then
-    python3 - "$f" <<'PY'
-import pathlib, sys
-path = pathlib.Path(sys.argv[1])
-text = path.read_text()
-old_start = "  qemu-system-x86_64 \\\n"
-new_start = """  local omarchy_dev_qemu=()
-  # shellcheck disable=SC2206
-  [[ -n ${OMARCHY_ISO_QEMU_EXTRA:-} ]] && omarchy_dev_qemu=($OMARCHY_ISO_QEMU_EXTRA)
+omarchy_dev_harness_is_patched() {
+  [[ -f $OMARCHY_DEV_ISO_HARNESS_PATCH ]] || return 1
+  (builtin cd "$OMARCHY_DEV_ISO" && git apply --reverse --check "$OMARCHY_DEV_ISO_HARNESS_PATCH") >/dev/null 2>&1
+}
 
-  qemu-system-x86_64 \\
-"""
-old_end = """    -daemonize \\
-    \"$@\"
-}"""
-new_end = """    -daemonize \\
-    \"${omarchy_dev_qemu[@]}\" \\
-    \"$@\"
-}"""
-if old_start not in text or old_end not in text:
-    sys.stderr.write(f"omarchy-dev: cannot hook QEMU_EXTRA in {path}: markers not found\n")
-    sys.exit(1)
-path.write_text(text.replace(old_start, new_start, 1).replace(old_end, new_end, 1))
-print(f"omarchy-dev: hooked OMARCHY_ISO_QEMU_EXTRA into {path}", file=sys.stderr)
-PY
+omarchy_dev_ensure_iso_harness_patch() {
+  local patch=$OMARCHY_DEV_ISO_HARNESS_PATCH
+  [[ -f $OMARCHY_DEV_ISO/bin/omarchy-iso-test ]] || omarchy_dev_die "missing ISO harness; run: mise setup"
+  [[ -f $patch ]] || omarchy_dev_die "missing harness patch: $patch"
+  omarchy_dev_harness_is_patched && return 0
+  if ! (builtin cd "$OMARCHY_DEV_ISO" && git apply --check "$patch") >/dev/null 2>&1; then
+    omarchy_dev_die "Harness patch conflicts with local contents; preserve local edits and refresh patches/omarchy-iso-test.patch"
   fi
-
-  if ! grep -qF 'OMARCHY_ISO_ACTIVATE_SYNC' "$f"; then
-    python3 - "$f" <<'PY'
-import pathlib, sys
-path = pathlib.Path(sys.argv[1])
-text = path.read_text()
-old = """  establish_session
-  sync_omarchy
-
-  local status=0
-"""
-new = r"""  establish_session
-  sync_omarchy
-
-  # omarchy-dev: when testing a worktree, make that tree the live Omarchy
-  # (same idea as omarchy-dev-link). Desktop/menu then use the synced code.
-  if $SYNC_ALL && [[ ${OMARCHY_ISO_ACTIVATE_SYNC:-0} == 1 ]]; then
-    local sync_abs="/home/$GUEST_USER/.local/share/omarchy"
-    log "Activating synced tree as live Omarchy → $sync_abs"
-    ssh_guest "echo $GUEST_PASSWORD | sudo -S -p '' sh -c \"
-      printf '%s\\n' 'export OMARCHY_PATH=$sync_abs' > /etc/omarchy.conf &&
-      printf '%s\\n' 'Defaults secure_path=\\\"$sync_abs/bin:/usr/local/sbin:/usr/local/bin:/usr/bin\\\"' > /etc/sudoers.d/omarchy-dev-path &&
-      chmod 440 /etc/sudoers.d/omarchy-dev-path
-    \""
-    log "Rebooting guest so the session picks up OMARCHY_PATH"
-    ssh_guest "echo $GUEST_PASSWORD | sudo -S reboot" >/dev/null 2>&1 || true
-    sleep 8
-    establish_session
-  fi
-
-  # omarchy-dev: interactive default — desktop ready, no automated checks.
-  if [[ ${OMARCHY_ISO_SKIP_TESTS:-0} == 1 ]]; then
-    # Acceptance base ships with offline.db only; installs need a real -Sy.
-    log "Refreshing pacman databases for interactive use"
-    if ! ssh_guest "echo $GUEST_PASSWORD | sudo -S -p '' pacman -Sy"; then
-      log "WARNING: pacman -Sy failed — package installs (e.g. grok-bot) will not work until it succeeds"
-    fi
-    log "Interactive session ready (automated checks skipped). Leaving VM running."
-    KEEP_RUNNING=true
-    return 0
-  fi
-
-  local status=0
-"""
-if old not in text:
-    sys.stderr.write(f"omarchy-dev: cannot hook ACTIVATE_SYNC in {path}: markers not found\n")
-    sys.exit(1)
-path.write_text(text.replace(old, new, 1))
-print(f"omarchy-dev: hooked OMARCHY_ISO_ACTIVATE_SYNC into {path}", file=sys.stderr)
-PY
-  fi
-
-  if ! grep -qF 'keep .git when activating' "$f"; then
-    python3 - "$f" <<'PY'
-import pathlib, sys
-path = pathlib.Path(sys.argv[1])
-text = path.read_text()
-old = """  if $SYNC_ALL; then
-    log \"Syncing $SYNC_DIR into the guest\"
-    tar -C \"$SYNC_DIR\" --exclude .git -cf - . | ssh_guest \"mkdir -p $target && tar -C $target -xf -\"
-  else
-"""
-new = """  if $SYNC_ALL; then
-    log \"Syncing $SYNC_DIR into the guest\"
-    # omarchy-dev: keep .git when activating a materialized checkout (update-dev).
-    if [[ ${OMARCHY_ISO_ACTIVATE_SYNC:-0} == 1 ]]; then
-      tar -C \"$SYNC_DIR\" -cf - . | ssh_guest \"mkdir -p $target && tar -C $target -xf -\"
-    else
-      tar -C \"$SYNC_DIR\" --exclude .git -cf - . | ssh_guest \"mkdir -p $target && tar -C $target -xf -\"
-    fi
-  else
-"""
-if old not in text:
-    sys.stderr.write(f"omarchy-dev: cannot hook sync .git keep in {path}: markers not found\n")
-    sys.exit(1)
-path.write_text(text.replace(old, new, 1))
-print(f"omarchy-dev: hooked sync keep-.git into {path}", file=sys.stderr)
-PY
-  fi
-
-  if ! grep -qF 'OMARCHY_ISO_SKIP_TESTS' "$f"; then
-    python3 - "$f" <<'PY'
-import pathlib, sys
-path = pathlib.Path(sys.argv[1])
-text = path.read_text()
-# Prefer the activate-aware closing fi right before shortcut smoke.
-if "    establish_session\n  fi\n\n  local status=0\n  shortcut_smoke_phase" in text:
-    old = "    establish_session\n  fi\n\n  local status=0\n  shortcut_smoke_phase"
-    new = """    establish_session
-  fi
-
-  # omarchy-dev: interactive default — desktop ready, no automated checks.
-  if [[ ${OMARCHY_ISO_SKIP_TESTS:-0} == 1 ]]; then
-    # Acceptance base ships with offline.db only; installs need a real -Sy.
-    log "Refreshing pacman databases for interactive use"
-    if ! ssh_guest "echo $GUEST_PASSWORD | sudo -S -p '' pacman -Sy"; then
-      log "WARNING: pacman -Sy failed — package installs (e.g. grok-bot) will not work until it succeeds"
-    fi
-    log "Interactive session ready (automated checks skipped). Leaving VM running."
-    KEEP_RUNNING=true
-    return 0
-  fi
-
-  local status=0
-  shortcut_smoke_phase"""
-elif "  sync_omarchy\n\n  local status=0\n  shortcut_smoke_phase" in text:
-    old = "  sync_omarchy\n\n  local status=0\n  shortcut_smoke_phase"
-    new = """  sync_omarchy
-
-  # omarchy-dev: interactive default — desktop ready, no automated checks.
-  if [[ ${OMARCHY_ISO_SKIP_TESTS:-0} == 1 ]]; then
-    # Acceptance base ships with offline.db only; installs need a real -Sy.
-    log "Refreshing pacman databases for interactive use"
-    if ! ssh_guest "echo $GUEST_PASSWORD | sudo -S -p '' pacman -Sy"; then
-      log "WARNING: pacman -Sy failed — package installs (e.g. grok-bot) will not work until it succeeds"
-    fi
-    log "Interactive session ready (automated checks skipped). Leaving VM running."
-    KEEP_RUNNING=true
-    return 0
-  fi
-
-  local status=0
-  shortcut_smoke_phase"""
-else:
-    sys.stderr.write(f"omarchy-dev: cannot hook SKIP_TESTS in {path}: markers not found\n")
-    sys.exit(1)
-path.write_text(text.replace(old, new, 1))
-print(f"omarchy-dev: hooked OMARCHY_ISO_SKIP_TESTS into {path}", file=sys.stderr)
-PY
-  fi
+  (builtin cd "$OMARCHY_DEV_ISO" && git apply "$patch") || return 1
+  echo "omarchy-dev: applied $(basename "$patch") to ISO harness" >&2
 }

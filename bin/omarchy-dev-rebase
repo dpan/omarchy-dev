@@ -1,5 +1,5 @@
 #!/bin/bash
-# Manage the shared acceptance base (ISO → base.qcow2 for stock + all worktrees).
+# Manage the shared base image (ISO → base.qcow2 for stock + all worktrees).
 set -euo pipefail
 
 SCRIPT_DIR="$(CDPATH= builtin cd -- "$(dirname "$0")" && builtin pwd)"
@@ -8,13 +8,26 @@ source "$SCRIPT_DIR/_lib.sh"
 
 usage() {
   cat <<'EOF'
-Usage: omarchy-dev-rebase [list|status]
+Usage: omarchy-dev-rebase [list|status|<target>]
 
-  (no args)  Fetch latest edge ISO and force-rebuild the shared acceptance base
-  list       List edge / stable / rc / local ISOs, pick one, rebuild base
-  status     Show which ISO/base is active right now
+  (no args)  Interactive pick (gum) from available ISOs, then rebuild base
+  list       Print available ISOs — no rebuild
+  status     Show which ISO / base image is active
+  <target>   Rebuild base from that ISO:
+               edge | stable | rc     channel shortcut (rc = newest rc)
+               <version>              e.g. 4.0.6, 4.5.0rc1, 2026.10.26.466
+               <iso-name> | <path>    as shown by list
 
-  One base is shared by stock testing and every worktree.
+  One base image is shared by stock testing and every worktree.
+
+Examples:
+  mise rebase list
+  mise rebase
+  mise rebase status
+  mise rebase edge
+  mise rebase stable
+  mise rebase rc
+  mise rebase 4.5.0rc1
 EOF
 }
 
@@ -30,10 +43,9 @@ case "${1:-}" in
     omarchy_dev_rebase_status
     ;;
   "")
-    omarchy_dev_rebase_edge
+    omarchy_dev_rebase
     ;;
   *)
-    usage >&2
-    exit 1
+    omarchy_dev_rebase "$1"
     ;;
 esac

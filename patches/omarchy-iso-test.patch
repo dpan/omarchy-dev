@@ -1,0 +1,142 @@
+diff --git a/bin/omarchy-iso-test b/bin/omarchy-iso-test
+index 3b3d7f8..6d0f5d1 100755
+--- a/bin/omarchy-iso-test
++++ b/bin/omarchy-iso-test
+@@ -330,6 +330,9 @@ DSL
+   local net_args=(-netdev "user,id=net0,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22" -device virtio-net-pci,netdev=net0)
+   $NO_NETWORK && net_args=(-nic none)
+ 
++  local omarchy_dev_qemu=()
++  IFS=$' \t\n' read -r -a omarchy_dev_qemu <<<"${OMARCHY_ISO_QEMU_EXTRA:-}"
++
+   qemu-system-x86_64 \
+     -cpu "host${CPU_ID:+,$CPU_ID}" -enable-kvm -machine q35,accel=kvm \
+     -smp "$(nproc)" \
+@@ -348,6 +351,7 @@ DSL
+     -serial "file:$serial" \
+     -pidfile "$PIDFILE" \
+     -daemonize \
++    "${omarchy_dev_qemu[@]}" \
+     "$@"
+ }
+ 
+@@ -1138,7 +1142,7 @@ establish_session() {
+     done
+     # Encrypted installs autologin once the disk is unlocked
+   else
+-    wait_for_ssh "$BOOT_TIMEOUT" "failure-session-ssh-timeout"
++    wait_for_ssh "$BOOT_TIMEOUT" "failure-session-ssh-timeout" || return $?
+     sleep 5
+   fi
+ 
+@@ -1324,28 +1328,90 @@ install_phase() {
+   stop_vm
+ }
+ 
+-sync_omarchy() {
++sync_omarchy() (
++  set -o pipefail
+   [[ -n $SYNC_DIR ]] || return 0
+ 
+   local target=".local/share/omarchy"
+ 
+   if $SYNC_ALL; then
+     log "Syncing $SYNC_DIR into the guest"
+-    tar -C "$SYNC_DIR" --exclude .git -cf - . | ssh_guest "mkdir -p $target && tar -C $target -xf -"
++    if [[ ${OMARCHY_ISO_ACTIVATE_SYNC:-0} == 1 ]]; then
++      tar -C "$SYNC_DIR" -cf - . \
++        | ssh_guest "rm -rf -- $target && mkdir -p $target && tar -C $target -xf -" || return $?
++    else
++      tar -C "$SYNC_DIR" --exclude .git -cf - . \
++        | ssh_guest "mkdir -p $target && tar -C $target -xf -" || return $?
++    fi
+   else
+     log "Syncing $SYNC_DIR/test into the guest"
+-    tar -C "$SYNC_DIR" -cf - test | ssh_guest "mkdir -p $target && tar -C $target -xf -"
++    tar -C "$SYNC_DIR" -cf - test \
++      | ssh_guest "mkdir -p $target && tar -C $target -xf -" || return $?
+   fi
+-}
++)
+ 
+ acceptance_phase() {
+   log "Booting acceptance VM from base image overlay"
+ 
+-  qemu-img create -f qcow2 -b "$BASE_DISK" -F qcow2 "$RUN_DIR/run.qcow2" >/dev/null
+-  start_vm "$RUN_DIR/run.qcow2" "$RUN_DIR/serial.log"
++  qemu-img create -f qcow2 -b "$BASE_DISK" -F qcow2 "$RUN_DIR/run.qcow2" >/dev/null || return $?
++  start_vm "$RUN_DIR/run.qcow2" "$RUN_DIR/serial.log" || return $?
+ 
+-  establish_session
+-  sync_omarchy
++  establish_session || return $?
++  sync_omarchy || return $?
++
++  local acceptance_omarchy_path="/usr/share/omarchy"
++  if $SYNC_ALL && [[ ${OMARCHY_ISO_ACTIVATE_SYNC:-0} == 1 ]]; then
++    local sync_abs="/home/$GUEST_USER/.local/share/omarchy"
++    log "Activating synced tree as live Omarchy → $sync_abs"
++    ssh_guest "echo $GUEST_PASSWORD | sudo -S -p '' sh -c \"
++      printf '%s\\n' 'export OMARCHY_PATH=$sync_abs' > /etc/omarchy.conf &&
++      printf '%s\\n' 'Defaults secure_path=\\\"$sync_abs/bin:/usr/local/sbin:/usr/local/bin:/usr/bin\\\"' > /etc/sudoers.d/omarchy-dev-path &&
++      chmod 440 /etc/sudoers.d/omarchy-dev-path
++    \"" || return $?
++    acceptance_omarchy_path=$sync_abs
++    log "Rebooting guest so the session picks up OMARCHY_PATH"
++    local reboot_status=0
++    ssh_guest "echo $GUEST_PASSWORD | sudo -S reboot" >/dev/null 2>&1 || reboot_status=$?
++    ((reboot_status == 0 || reboot_status == 255)) || return "$reboot_status"
++    sleep 8
++    establish_session || return $?
++  fi
++
++  if [[ ${OMARCHY_ISO_SKIP_TESTS:-0} == 1 ]]; then
++    # Acceptance base ships with offline.db only; installs need a real -Sy.
++    log "Refreshing pacman databases for interactive use"
++    if ! ssh_guest "echo $GUEST_PASSWORD | sudo -S -p '' pacman -Sy"; then
++      log "WARNING: pacman -Sy failed — package installs (e.g. grok-bot) will not work until it succeeds"
++    fi
++
++    if [[ ${OMARCHY_DEV_SYNC_HOST_CONFIG:-0} == 1 ]]; then
++      local _hc_home _hc_dirs _hc_d _hc_any=false
++      _hc_home=${OMARCHY_DEV_HOST_HOME:-$HOME}
++      _hc_dirs=${OMARCHY_DEV_HOST_CONFIG_DIRS:-omarchy hypr alacritty ghostty kitty foot walker}
++      log "Syncing host config from $_hc_home/.config into the guest"
++      for _hc_d in $_hc_dirs; do
++        [[ -d $_hc_home/.config/$_hc_d ]] || continue
++        _hc_any=true
++        log "  + $_hc_d"
++        if [[ $_hc_d == hypr ]]; then
++          tar -C "$_hc_home/.config" \
++            --exclude='hypr/monitors.conf' --exclude='hypr/monitors.lua' \
++            -cf - "$_hc_d" \
++            | ssh_guest "mkdir -p .config && tar -C .config -xf -" || return $?
++        else
++          tar -C "$_hc_home/.config" -cf - "$_hc_d" \
++            | ssh_guest "mkdir -p .config && tar -C .config -xf -" || return $?
++        fi
++      done
++      if ! $_hc_any; then
++        log "WARNING: --host-config set but no allowlisted dirs under $_hc_home/.config"
++      fi
++    fi
++
++    log "Interactive session ready (automated checks skipped). Leaving VM running."
++    KEEP_RUNNING=true
++    return 0
++  fi
+ 
+   local status=0
+   shortcut_smoke_phase || status=1
+@@ -1358,10 +1424,8 @@ acceptance_phase() {
+     ssh_guest "bash .local/share/omarchy/test/all" || status=$?
+   fi
+ 
+-  # The product under test is always the installed tree — VM runs verify the
+-  # finished product, never a dev-linked checkout.
+   log "Running acceptance suite"
+-  ssh_guest "OMARCHY_PATH=/usr/share/omarchy OMARCHY_ACCEPTANCE_DIR=/tmp/omarchy-acceptance \
++  ssh_guest "OMARCHY_PATH=$acceptance_omarchy_path OMARCHY_ACCEPTANCE_DIR=/tmp/omarchy-acceptance \
+     OMARCHY_ACCEPTANCE_SUDO_PASSWORD=$GUEST_PASSWORD bash .local/share/omarchy/test/acceptance" || status=$?
+ 
+   log "Collecting artifacts into $RUN_DIR"
