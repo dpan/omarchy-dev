@@ -1,0 +1,94 @@
+# Omarchy feature-dev workspace.
+# Happy path: mise setup → mise test [tree] → mise rebase when needed.
+# Wrappers on PATH via [env] when you cd here (Omarchy activates mise).
+
+min_version = "2025.8.0"
+
+[env]
+_.path = ["bin"]
+OMARCHY_DEV_ROOT = "{{config_root}}"
+
+# Load mise tab completion into the current shell on enter (bash or zsh).
+[[hooks.enter]]
+shell = "zsh"
+script = '''
+if ! (( $+functions[_mise] )); then
+  if ! (( $+functions[compdef] )); then
+    autoload -Uz compinit
+    compinit -i
+  fi
+  eval "$(command mise completion zsh)"
+fi
+'''
+
+[[hooks.enter]]
+shell = "bash"
+script = 'complete -p mise &>/dev/null || eval "$(command mise completion bash)"'
+
+[bootstrap.packages]
+"pacman:qemu-full" = "latest"
+"pacman:edk2-ovmf" = "latest"
+"pacman:socat" = "latest"
+"pacman:imagemagick" = "latest"
+"pacman:tesseract" = "latest"
+"pacman:tesseract-data-eng" = "latest"
+"pacman:jq" = "latest"
+"pacman:curl" = "latest"
+
+[tasks.setup]
+description = "Prepare workspace (packages, clones, ISO, acceptance base)"
+usage = '''
+flag "--no-iso" help="Skip ISO download"
+flag "--no-base" help="Skip acceptance base"
+flag "--no-packages" help="Skip mise bootstrap packages apply"
+flag "--channel <channel>" help="ISO channel" default="edge" {
+  choices "edge" "stable"
+}
+'''
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+args=()
+[[ ${usage_no_iso:-false} == true ]] && args+=(--no-iso)
+[[ ${usage_no_base:-false} == true ]] && args+=(--no-base)
+[[ ${usage_no_packages:-false} == true ]] && args+=(--no-packages)
+[[ -n ${usage_channel:-} ]] && args+=(--channel "$usage_channel")
+exec bin/omarchy-dev-setup "${args[@]}"
+'''
+
+[tasks.test]
+description = "Boot interactive VM on current base (stock or worktree)"
+usage = '''
+arg "[tree]" help="Worktree name/path; omit for stock"
+complete "tree" run="command ls -1 worktrees"
+flag "--graphical" help="QEMU window (default)"
+flag "--ssh" help="Headless (no window)"
+flag "--grab-kbd" help="Keyboard grab on (default)"
+flag "--no-grab-kbd" help="Do not grab the host keyboard"
+flag "--run-tests" help="Run automated checks, then stop the VM"
+'''
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+args=()
+[[ ${usage_graphical:-false} == true ]] && args+=(--graphical)
+[[ ${usage_ssh:-false} == true ]] && args+=(--ssh)
+[[ ${usage_grab_kbd:-false} == true ]] && args+=(--grab-kbd)
+[[ ${usage_no_grab_kbd:-false} == true ]] && args+=(--no-grab-kbd)
+[[ ${usage_run_tests:-false} == true ]] && args+=(--run-tests)
+[[ -n ${usage_tree:-} ]] && args+=("$usage_tree")
+exec bin/omarchy-dev-test "${args[@]}"
+'''
+
+[tasks.rebase]
+description = "Rebuild shared acceptance base (default: latest edge ISO)"
+usage = '''
+arg "[cmd]" help="list (pick ISO) | status (show active base) | omit for edge" {
+  choices "list" "status"
+}
+'''
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+exec bin/omarchy-dev-rebase ${usage_cmd:+"$usage_cmd"}
+'''

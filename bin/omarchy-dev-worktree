@@ -1,0 +1,72 @@
+#!/bin/bash
+# Create or list git worktrees under omarchy-dev/worktrees/.
+set -euo pipefail
+
+SCRIPT_DIR="$(CDPATH= builtin cd -- "$(dirname "$0")" && builtin pwd)"
+# shellcheck source=./_lib.sh
+source "$SCRIPT_DIR/_lib.sh"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  omarchy-dev-worktree list
+  omarchy-dev-worktree add <name> [start-point]
+  omarchy-dev-worktree remove <name>
+
+  <name>        Directory under worktrees/ (and usually the branch feature/<name>)
+  start-point   Branch/commit to base on (default: quattro)
+
+Examples:
+  omarchy-dev-worktree add gui-default-agents quattro
+  omarchy-dev-worktree list
+EOF
+}
+
+[[ -d $OMARCHY_DEV_OMARCHY/.git || -f $OMARCHY_DEV_OMARCHY/.git ]] ||
+  omarchy_dev_die "No git checkout at $OMARCHY_DEV_OMARCHY"
+
+cmd=${1:-list}
+shift || true
+
+case "$cmd" in
+  list | ls)
+    git -C "$OMARCHY_DEV_OMARCHY" worktree list
+    ;;
+  add | new)
+    name=${1:-}
+    start=${2:-quattro}
+    [[ -n $name ]] || {
+      usage >&2
+      exit 1
+    }
+    dest=$OMARCHY_DEV_WORKTREES/$name
+    [[ ! -e $dest ]] || omarchy_dev_die "Already exists: $dest"
+    branch=feature/$name
+    if git -C "$OMARCHY_DEV_OMARCHY" show-ref --verify --quiet "refs/heads/$branch"; then
+      echo "Checking out existing branch $branch → $dest"
+      git -C "$OMARCHY_DEV_OMARCHY" worktree add "$dest" "$branch"
+    else
+      echo "Creating $branch from $start → $dest"
+      git -C "$OMARCHY_DEV_OMARCHY" worktree add -b "$branch" "$dest" "$start"
+    fi
+    echo "Tree: $dest"
+    echo "Test: mise test -- $name"
+    ;;
+  remove | rm)
+    name=${1:-}
+    [[ -n $name ]] || {
+      usage >&2
+      exit 1
+    }
+    dest=$OMARCHY_DEV_WORKTREES/$name
+    [[ -d $dest ]] || omarchy_dev_die "No worktree at $dest"
+    git -C "$OMARCHY_DEV_OMARCHY" worktree remove "$dest"
+    ;;
+  -h | --help | help)
+    usage
+    ;;
+  *)
+    usage >&2
+    exit 1
+    ;;
+esac

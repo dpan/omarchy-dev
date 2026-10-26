@@ -1,0 +1,106 @@
+#!/bin/bash
+# Boot the shared acceptance base for interactive use (default), or run
+# automated checks with --run-tests.
+set -euo pipefail
+
+SCRIPT_DIR="$(CDPATH= builtin cd -- "$(dirname "$0")" && builtin pwd)"
+# shellcheck source=./_lib.sh
+source "$SCRIPT_DIR/_lib.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: omarchy-dev-test [session-flags] [--run-tests] [tree] [-- iso-test-args...]
+
+  Boot the current acceptance base (see: mise rebase status) in a QEMU
+  window so you can use the desktop. Leaves the VM running.
+
+  No tree → stock installed Omarchy.
+  With tree → that worktree becomes the live Omarchy in the guest
+  (menu, bin/, defaults).
+
+  --run-tests   Also run automated checks, then stop the VM
+             (pass --keep-running after -- if you want it left up).
+
+  Default session: QEMU window + keyboard grab.
+
+EOF
+  omarchy_dev_session_flags_help
+  cat <<'EOF'
+
+Examples:
+  mise test
+  mise test -- my-feature
+  mise test -- --run-tests my-feature
+  mise test -- --ssh --no-grab-kbd my-feature
+EOF
+}
+
+case "${1:-}" in
+  -h | --help)
+    usage
+    exit 0
+    ;;
+esac
+
+omarchy_dev_session_parse_flags "$@"
+set -- "${OMARCHY_DEV_SESSION_REST[@]}"
+
+tree_arg=
+run_tests=false
+extra=()
+
+while (($#)); do
+  case "$1" in
+    --run-tests)
+      run_tests=true
+      shift
+      ;;
+    --)
+      shift
+      extra+=("$@")
+      set --
+      ;;
+    *)
+      if [[ -z $tree_arg && $1 != -* ]]; then
+        tree_arg=$1
+      else
+        extra+=("$1")
+      fi
+      shift
+      ;;
+  esac
+done
+
+omarchy_dev_require_iso_repo
+omarchy_dev_ensure_iso_qemu_extra_hook
+omarchy_dev_session_prepare "omarchy-dev-test"
+
+iso=$(omarchy_dev_require_base)
+omarchy_dev_rebase_status >&2
+
+builtin cd "$OMARCHY_DEV_ISO"
+
+iso_args=("$iso" --reuse-base --no-preview)
+if $run_tests; then
+  echo "Mode: run-tests (automated checks, then stop unless --keep-running)"
+  unset OMARCHY_ISO_SKIP_TESTS || true
+else
+  echo "Mode: interactive desktop (VM left running; pass --run-tests for automated checks)"
+  export OMARCHY_ISO_SKIP_TESTS=1
+  iso_args+=(--keep-running)
+fi
+
+if [[ -z $tree_arg ]]; then
+  echo "Tree: stock base (no worktree sync)"
+  echo "Using ISO: $iso"
+  ./bin/omarchy-iso-test "${iso_args[@]}" "${extra[@]}"
+else
+  tree=$(omarchy_dev_resolve_tree "$tree_arg")
+  echo "Tree: $tree (live Omarchy in guest)"
+  echo "Using ISO: $iso"
+  echo "Materializing a standalone git checkout for guest sync (iso-test strips .git)…"
+  sync_tree=$(omarchy_dev_materialize_sync_tree "$tree")
+  export OMARCHY_PATH=$tree
+  export OMARCHY_ISO_ACTIVATE_SYNC=1
+  ./bin/omarchy-iso-test "${iso_args[@]}" --sync-all "$sync_tree" "${extra[@]}"
+fi

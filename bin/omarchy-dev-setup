@@ -1,0 +1,120 @@
+#!/bin/bash
+# Prepare the workspace: packages, clones, ISO, acceptance base.
+set -euo pipefail
+
+SCRIPT_DIR="$(CDPATH= builtin cd -- "$(dirname "$0")" && builtin pwd)"
+# shellcheck source=./_lib.sh
+source "$SCRIPT_DIR/_lib.sh"
+
+FETCH_ISO=true
+CHANNEL=edge
+APPLY_PACKAGES=true
+BUILD_BASE=true
+
+OMARCHY_REMOTE="${OMARCHY_REMOTE:-https://github.com/omacom/omarchy.git}"
+OMARCHY_REF="${OMARCHY_REF:-quattro}"
+ISO_REMOTE="${ISO_REMOTE:-https://github.com/omacom/omarchy-iso.git}"
+
+usage() {
+  cat <<'EOF'
+Usage: omarchy-dev-setup [options]
+
+  Prepare this workspace for feature testing:
+    1. mise trust (if needed)
+    2. mise bootstrap packages apply
+    3. clone omarchy/ when missing
+    4. clone omarchy-iso/ when missing
+    5. download channel ISO (unless skipped)
+    6. ensure acceptance base (unless skipped)
+
+Options:
+  --channel edge|stable   ISO channel (default: edge)
+  --no-iso                Skip ISO download
+  --no-base               Skip acceptance base
+  --no-packages           Skip mise bootstrap packages apply
+  -h, --help              Show this help
+EOF
+}
+
+while (($#)); do
+  case "$1" in
+    --channel)
+      CHANNEL=$2
+      shift
+      ;;
+    --no-iso) FETCH_ISO=false ;;
+    --no-packages) APPLY_PACKAGES=false ;;
+    --no-base) BUILD_BASE=false ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 1
+      ;;
+  esac
+  shift
+done
+
+echo "==> omarchy-dev setup ($OMARCHY_DEV_ROOT)"
+
+if command -v mise >/dev/null 2>&1; then
+  if [[ -f $OMARCHY_DEV_ROOT/mise.toml ]]; then
+    mise -C "$OMARCHY_DEV_ROOT" trust "$OMARCHY_DEV_ROOT" >/dev/null 2>&1 || true
+  fi
+  if $APPLY_PACKAGES; then
+    echo "==> Host packages (mise bootstrap)"
+    mise -C "$OMARCHY_DEV_ROOT" bootstrap packages apply --yes
+  fi
+else
+  omarchy_dev_die "mise is required (Omarchy ships it). Install mise, then re-run."
+fi
+
+mkdir -p "$OMARCHY_DEV_WORKTREES" "$OMARCHY_DEV_VMS"
+
+if [[ -L $OMARCHY_DEV_OMARCHY ]]; then
+  omarchy_dev_die "$OMARCHY_DEV_OMARCHY is a symlink; remove it and re-run so setup can clone a real tree"
+fi
+
+if [[ ! -d $OMARCHY_DEV_OMARCHY/.git && ! -f $OMARCHY_DEV_OMARCHY/.git ]]; then
+  if [[ -e $OMARCHY_DEV_OMARCHY ]]; then
+    omarchy_dev_die "$OMARCHY_DEV_OMARCHY exists but is not a git checkout"
+  fi
+  echo "==> Cloning omarchy ($OMARCHY_REF) → $OMARCHY_DEV_OMARCHY"
+  git clone --branch "$OMARCHY_REF" "$OMARCHY_REMOTE" "$OMARCHY_DEV_OMARCHY"
+else
+  echo "==> omarchy checkout present: $OMARCHY_DEV_OMARCHY"
+fi
+
+fetch_args=(--channel "$CHANNEL")
+$FETCH_ISO && fetch_args+=(--iso)
+
+if $FETCH_ISO; then
+  if meta_hint=$(curl -fsSL "$(omarchy_dev_channel_url "$CHANNEL")" 2>/dev/null); then
+    need=$(jq -r '.size // 0' <<<"$meta_hint")
+    if ((need > 0)); then
+      avail=$(df -B1 --output=avail "$OMARCHY_DEV_ROOT" | tail -n1)
+      echo "==> ISO ≈ $((need / 1024 / 1024 / 1024)) GiB; free on volume ≈ $((avail / 1024 / 1024 / 1024)) GiB"
+      if ((avail < need + 2 * 1024 * 1024 * 1024)); then
+        omarchy_dev_die "Not enough free disk (need ~$((need / 1024 / 1024 / 1024)) GiB + 2 GiB headroom)"
+      fi
+    fi
+  fi
+fi
+
+echo "==> Layout + artifacts"
+ISO_REMOTE=$ISO_REMOTE "$SCRIPT_DIR/_omarchy-dev-fetch" "${fetch_args[@]}"
+
+if $BUILD_BASE; then
+  echo "==> Acceptance base"
+  omarchy_dev_ensure_base
+else
+  echo "==> Skipping acceptance base (--no-base)"
+fi
+
+echo
+echo "==> Setup complete"
+echo "  mise rebase status"
+echo "  omarchy-dev-worktree add <name> quattro"
+echo "  mise test -- <name>"

@@ -1,0 +1,17 @@
+# Nested checkouts (manage separately; never commit into this meta repo)
+omarchy
+omarchy-iso
+omarchy-pkgs/
+worktrees/
+
+# Large regenerable artifacts
+vms/**
+!vms/.gitkeep
+
+# Host-local keyboard choice for --grab-kbd (path under /dev/input/by-id)
+.grab-kbd
+
+# Editor / OS noise
+*~
+.DS_Store
+*.swp

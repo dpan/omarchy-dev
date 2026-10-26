@@ -1,0 +1,39 @@
+#!/bin/bash
+# Manage the shared acceptance base (ISO → base.qcow2 for stock + all worktrees).
+set -euo pipefail
+
+SCRIPT_DIR="$(CDPATH= builtin cd -- "$(dirname "$0")" && builtin pwd)"
+# shellcheck source=./_lib.sh
+source "$SCRIPT_DIR/_lib.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: omarchy-dev-rebase [list|status]
+
+  (no args)  Fetch latest edge ISO and force-rebuild the shared acceptance base
+  list       List edge / stable / rc / local ISOs, pick one, rebuild base
+  status     Show which ISO/base is active right now
+
+  One base is shared by stock testing and every worktree.
+EOF
+}
+
+case "${1:-}" in
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  list)
+    omarchy_dev_rebase_list
+    ;;
+  status)
+    omarchy_dev_rebase_status
+    ;;
+  "")
+    omarchy_dev_rebase_edge
+    ;;
+  *)
+    usage >&2
+    exit 1
+    ;;
+esac
