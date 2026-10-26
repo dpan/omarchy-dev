@@ -8,6 +8,10 @@ Humans: [`README.md`](README.md). Assume `cd` into the checkout; `OMARCHY_DEV_RO
 
 In the same change, update `AGENTS.md` and `README.md` when wrappers, `mise.toml`, or setup/test/rebase behavior change. No machine-specific absolute paths.
 
+## Commits
+
+Use [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/#specification) for this meta repo.
+
 ## Layout
 
 ```text
@@ -100,7 +104,6 @@ Overrides: `OMARCHY_DEV_OMARCHY`, `OMARCHY_DEV_ISO`, `OMARCHY_DEV_VMS`, `OMARCHY
 - Do not put `bin/` on `PATH` in shell rc; use mise.  
 - Do not symlink `omarchy/` / `omarchy-iso/` outside this checkout.  
 - Do not do feature day-to-day work on `omarchy/` when a worktree exists.  
-- Do not commit `vms/`, `omarchy/`, `omarchy-iso/`, or `worktrees/`.  
 - Do not document a fixed clone path here.
 
 ## Refreshing

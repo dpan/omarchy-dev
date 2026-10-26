@@ -1,4 +1,4 @@
-# Nested checkouts (manage separately; never commit into this meta repo)
+# Nested checkouts (own git trees; not part of this meta repo)
 omarchy
 omarchy-iso
 omarchy-pkgs/
