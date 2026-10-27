@@ -120,13 +120,16 @@ omarchy_dev_base_files_are_valid() {
 }
 
 omarchy_dev_base_is_usable() {
-  local iso disk marker expected
+  local iso disk marker expected recorded
   iso=$(realpath -e -- "$1") || return 1
   disk=$(omarchy_dev_base_disk_for_iso "$iso")
   marker=${disk%/*}/base.complete
   [[ -f $iso && -f $disk && -f $marker ]] || return 1
   expected=$(omarchy_dev_base_fingerprint "$iso" "$disk") || return 1
-  [[ $(<"$marker") == "$expected" ]] || return 1
+  # Device numbers can change across remounts without changing either file.
+  recorded=$(sed '3,4s/^[0-9][0-9]*://' "$marker") || return 1
+  expected=$(sed '3,4s/^[0-9][0-9]*://' <<<"$expected") || return 1
+  [[ $recorded == "$expected" ]] || return 1
   omarchy_dev_base_files_are_valid "$disk"
 }
 

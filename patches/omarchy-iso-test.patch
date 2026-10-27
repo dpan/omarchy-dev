@@ -1,5 +1,5 @@
 diff --git a/bin/omarchy-iso-test b/bin/omarchy-iso-test
-index 3b3d7f8..6d0f5d1 100755
+index 3b3d7f8..27dc275 100755
 --- a/bin/omarchy-iso-test
 +++ b/bin/omarchy-iso-test
 @@ -330,6 +330,9 @@ DSL
@@ -20,6 +20,24 @@ index 3b3d7f8..6d0f5d1 100755
      "$@"
  }
  
+@@ -491,7 +495,7 @@ session_started() {
+ }
+ 
+ ssh_session() {
+-  local command="$1"
++  local command="$1" omarchy_path="${2:-/usr/share/omarchy}"
+ 
+   ssh_guest "export XDG_RUNTIME_DIR=/run/user/\$(id -u); \
+     export DBUS_SESSION_BUS_ADDRESS=unix:path=\$XDG_RUNTIME_DIR/bus; \
+@@ -499,7 +503,7 @@ ssh_session() {
+     export LANG=\${LANG:-C.UTF-8}; \
+     export HYPRLAND_INSTANCE_SIGNATURE=\$(ls -t \$XDG_RUNTIME_DIR/hypr | head -1); \
+     export WAYLAND_DISPLAY=\$(find \$XDG_RUNTIME_DIR -maxdepth 1 -name 'wayland-*' ! -name '*.lock' -printf '%f\\n' | head -1); \
+-    export OMARCHY_PATH=/usr/share/omarchy; \
++    export OMARCHY_PATH=$(printf '%q' "$omarchy_path"); \
+     export PATH=\$OMARCHY_PATH/bin:\$PATH; \
+     $command" </dev/null
+ }
 @@ -1138,7 +1142,7 @@ establish_session() {
      done
      # Encrypted installs autologin once the disk is unlocked
@@ -29,7 +47,7 @@ index 3b3d7f8..6d0f5d1 100755
      sleep 5
    fi
  
-@@ -1324,28 +1328,90 @@ install_phase() {
+@@ -1324,28 +1328,243 @@ install_phase() {
    stop_vm
  }
  
@@ -56,9 +74,180 @@ index 3b3d7f8..6d0f5d1 100755
 +    tar -C "$SYNC_DIR" -cf - test \
 +      | ssh_guest "mkdir -p $target && tar -C $target -xf -" || return $?
    fi
--}
 +)
++
++run_worktree_migrations() {
++  local active_path="$1" pending pending_status=0 transaction transaction_command
++  log "Checking pending migrations in the active guest checkout"
++  pending=$(ssh_session '"$OMARCHY_PATH/bin/omarchy-migrate" --pending' "$active_path") || pending_status=$?
++  if [[ $pending_status == 1 && -z $pending ]]; then
++    log "No pending migrations in the active guest checkout"
++    if [[ ${OMARCHY_ISO_SKIP_TESTS:-0} == 1 ]]; then
++      log "Refreshing pacman databases for interactive use"
++      if ! ssh_guest "echo $GUEST_PASSWORD | sudo -S -p '' pacman -Sy"; then
++        log "WARNING: pacman -Sy failed — package installs (e.g. grok-bot) will not work until it succeeds"
++      fi
++    fi
++    return 0
++  fi
++  if [[ $pending_status != 0 || -z $pending ]]; then
++    printf 'Cannot query pending migrations (status %s):\n%s\n' "$pending_status" "$pending" >&2
++    return 1
++  fi
++  printf 'Pending guest migrations:\n%s\n' "$pending"
++
++  transaction=$(cat <<'GUEST'
++set -uo pipefail
++work_pid= refresh_pid=
++transaction_pid=$$
++
++stop_process_tree() {
++  local pid="$1" child
++  for child in $(pgrep -P "$pid" || true); do
++    stop_process_tree "$child"
++  done
++  kill "$pid" 2>/dev/null || true
+ }
  
++cleanup() {
++  local status=$?
++  trap - EXIT
++  trap '' HUP INT TERM USR1
++  if [[ -n $refresh_pid ]]; then
++    stop_process_tree "$refresh_pid"
++    wait "$refresh_pid" 2>/dev/null || true
++  fi
++  if [[ -n $work_pid ]]; then
++    stop_process_tree "$work_pid"
++    wait "$work_pid" 2>/dev/null || true
++  fi
++  sudo -k || status=$?
++  exit "$status"
++}
++trap cleanup EXIT
++trap 'echo "Guest migration preparation interrupted" >&2; exit 1' HUP INT TERM USR1
++
++printf '%s\n' "$1" | sudo -S -p '' -v || exit $?
++(
++  while sleep 30; do
++    sudo -n -v || {
++      echo "Cannot refresh guest migration credentials" >&2
++      kill -USR1 "$transaction_pid"
++      exit 1
++    }
++  done
++) &
++refresh_pid=$!
++
++sudo -n pacman -Sy &
++work_pid=$!
++wait "$work_pid" || exit $?
++work_pid=
++
++"$OMARCHY_PATH/bin/omarchy-migrate" &
++work_pid=$!
++wait "$work_pid" || exit $?
++work_pid=
++
++pending_status=0
++pending=$("$OMARCHY_PATH/bin/omarchy-migrate" --pending) || pending_status=$?
++if [[ $pending_status != 1 || -n $pending ]]; then
++  printf 'Migration queue did not finish (pending status %s):\n%s\n' "$pending_status" "$pending" >&2
++  exit 1
++fi
++GUEST
++)
++  printf -v transaction_command '%q ' bash -c "$transaction" omarchy-migrations "$GUEST_PASSWORD"
++  ssh_session "script -qec $(printf '%q' "$transaction_command") /dev/null" "$active_path" || return $?
++  log "Pending guest migrations completed"
++}
++
++prepare_guest() (
++  set -o pipefail
++  local active_worktree_path="${1:-}" copy_host=false
++  local guest_omarchy_path=${active_worktree_path:-/usr/share/omarchy}
++  if [[ ${OMARCHY_ISO_SKIP_TESTS:-0} == 1 && ${OMARCHY_DEV_SYNC_HOST_CONFIG:-0} == 1 ]]; then
++    copy_host=true
++  fi
++  local host_home=${OMARCHY_DEV_HOST_HOME:-$HOME}
++  local config_dirs=${OMARCHY_DEV_HOST_CONFIG_DIRS:-omarchy hypr alacritty ghostty kitty foot}
++  local config_dir any_config=false theme= background= background_relative= background_quoted=
++
++  if $copy_host; then
++    log "Syncing host config from $host_home/.config into the guest"
++    for config_dir in $config_dirs; do
++      [[ -d $host_home/.config/$config_dir ]] || continue
++      any_config=true
++      log "  + $config_dir"
++      if [[ $config_dir == hypr ]]; then
++        tar -C "$host_home/.config" \
++          --exclude='hypr/monitors.conf' --exclude='hypr/monitors.lua' \
++          -cf - "$config_dir" \
++          | ssh_guest "mkdir -p .config && tar -C .config -xf -" || return $?
++      else
++        tar -C "$host_home/.config" -cf - "$config_dir" \
++          | ssh_guest "mkdir -p .config && tar -C .config -xf -" || return $?
++      fi
++    done
++    if ! $any_config; then
++      log "WARNING: --host-config set but no allowlisted dirs under $host_home/.config"
++    fi
++
++    if [[ -d $host_home/.local/state/omarchy/settings ]]; then
++      log "Syncing host Omarchy settings into the guest"
++      tar -C "$host_home/.local/state/omarchy/settings" -cf - . \
++        | ssh_guest "mkdir -p .local/state/omarchy/settings && tar -C .local/state/omarchy/settings -xf -" || return $?
++    fi
++
++    local selected_background=$host_home/.local/state/omarchy/current/background
++    if [[ -e $selected_background || -L $selected_background ]]; then
++      background=$(readlink -f -- "$selected_background") || {
++        log "ERROR: Cannot resolve host background '$selected_background'" >&2
++        return 1
++      }
++      if [[ ! -f $background || ! -r $background ]]; then
++        log "ERROR: Host background '$selected_background' must resolve to a readable regular file" >&2
++        return 1
++      fi
++      background_relative=".local/state/omarchy/host-background/${background##*/}"
++      printf -v background_quoted '%q' "$background_relative"
++      log "Copying selected host background into the guest"
++      ssh_guest "mkdir -p .local/state/omarchy/host-background && cat > $background_quoted" <"$background" || return $?
++    fi
++
++    if [[ -r $host_home/.local/state/omarchy/current/theme.name ]]; then
++      theme=$(<"$host_home/.local/state/omarchy/current/theme.name")
++      theme=${theme//$'\r'/}
++      theme=${theme//$'\n'/}
++    fi
++  fi
++
++  if [[ -n $active_worktree_path ]]; then
++    run_worktree_migrations "$active_worktree_path" || return $?
++  else
++    log "Migrations skipped for stock base (no worktree selected)"
++  fi
++
++  if $copy_host; then
++    if [[ -n $theme ]]; then
++      log "Applying host theme '$theme' in the guest"
++      ssh_session "omarchy-theme-set $(printf '%q' "$theme")" "$guest_omarchy_path" || return $?
++    else
++      log "WARNING: --host-config set but no host theme.name under $host_home/.local/state/omarchy/current"
++    fi
++
++    if [[ -n $background_relative ]]; then
++      log "Applying selected host background in the guest"
++      ssh_session "omarchy-theme-bg-set \"\$HOME\"/$background_quoted" "$guest_omarchy_path" || return $?
++    fi
++  fi
++
++  if $copy_host || [[ -n $active_worktree_path ]]; then
++    log "Restarting Omarchy shell so guest preparation takes effect"
++    ssh_session "omarchy-restart-shell" "$guest_omarchy_path" || return $?
++  fi
++)
++
  acceptance_phase() {
    log "Booting acceptance VM from base image overlay"
  
@@ -72,7 +261,7 @@ index 3b3d7f8..6d0f5d1 100755
 +  establish_session || return $?
 +  sync_omarchy || return $?
 +
-+  local acceptance_omarchy_path="/usr/share/omarchy"
++  local acceptance_omarchy_path="/usr/share/omarchy" active_worktree_path=
 +  if $SYNC_ALL && [[ ${OMARCHY_ISO_ACTIVATE_SYNC:-0} == 1 ]]; then
 +    local sync_abs="/home/$GUEST_USER/.local/share/omarchy"
 +    log "Activating synced tree as live Omarchy → $sync_abs"
@@ -82,6 +271,7 @@ index 3b3d7f8..6d0f5d1 100755
 +      chmod 440 /etc/sudoers.d/omarchy-dev-path
 +    \"" || return $?
 +    acceptance_omarchy_path=$sync_abs
++    active_worktree_path=$sync_abs
 +    log "Rebooting guest so the session picks up OMARCHY_PATH"
 +    local reboot_status=0
 +    ssh_guest "echo $GUEST_PASSWORD | sudo -S reboot" >/dev/null 2>&1 || reboot_status=$?
@@ -90,37 +280,17 @@ index 3b3d7f8..6d0f5d1 100755
 +    establish_session || return $?
 +  fi
 +
-+  if [[ ${OMARCHY_ISO_SKIP_TESTS:-0} == 1 ]]; then
++  if [[ ${OMARCHY_ISO_SKIP_TESTS:-0} == 1 && -z $active_worktree_path ]]; then
 +    # Acceptance base ships with offline.db only; installs need a real -Sy.
 +    log "Refreshing pacman databases for interactive use"
 +    if ! ssh_guest "echo $GUEST_PASSWORD | sudo -S -p '' pacman -Sy"; then
 +      log "WARNING: pacman -Sy failed — package installs (e.g. grok-bot) will not work until it succeeds"
 +    fi
++  fi
 +
-+    if [[ ${OMARCHY_DEV_SYNC_HOST_CONFIG:-0} == 1 ]]; then
-+      local _hc_home _hc_dirs _hc_d _hc_any=false
-+      _hc_home=${OMARCHY_DEV_HOST_HOME:-$HOME}
-+      _hc_dirs=${OMARCHY_DEV_HOST_CONFIG_DIRS:-omarchy hypr alacritty ghostty kitty foot walker}
-+      log "Syncing host config from $_hc_home/.config into the guest"
-+      for _hc_d in $_hc_dirs; do
-+        [[ -d $_hc_home/.config/$_hc_d ]] || continue
-+        _hc_any=true
-+        log "  + $_hc_d"
-+        if [[ $_hc_d == hypr ]]; then
-+          tar -C "$_hc_home/.config" \
-+            --exclude='hypr/monitors.conf' --exclude='hypr/monitors.lua' \
-+            -cf - "$_hc_d" \
-+            | ssh_guest "mkdir -p .config && tar -C .config -xf -" || return $?
-+        else
-+          tar -C "$_hc_home/.config" -cf - "$_hc_d" \
-+            | ssh_guest "mkdir -p .config && tar -C .config -xf -" || return $?
-+        fi
-+      done
-+      if ! $_hc_any; then
-+        log "WARNING: --host-config set but no allowlisted dirs under $_hc_home/.config"
-+      fi
-+    fi
++  prepare_guest "$active_worktree_path" || return $?
 +
++  if [[ ${OMARCHY_ISO_SKIP_TESTS:-0} == 1 ]]; then
 +    log "Interactive session ready (automated checks skipped). Leaving VM running."
 +    KEEP_RUNNING=true
 +    return 0
@@ -128,7 +298,7 @@ index 3b3d7f8..6d0f5d1 100755
  
    local status=0
    shortcut_smoke_phase || status=1
-@@ -1358,10 +1424,8 @@ acceptance_phase() {
+@@ -1358,10 +1577,8 @@ acceptance_phase() {
      ssh_guest "bash .local/share/omarchy/test/all" || status=$?
    fi
  

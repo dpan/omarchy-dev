@@ -18,12 +18,18 @@ Usage: omarchy-dev-test [session-flags] [--run-tests] [--host-config] [tree] [--
   With tree → that worktree becomes the live Omarchy in the guest
   (menu, bin/, defaults).
 
+  Worktree runs apply pending migrations before readiness or automated checks.
+  With --host-config, copied settings are migrated before appearance is applied.
+
   --run-tests     Also run automated checks, then stop the VM
                   (pass --keep-running after -- if you want it left up).
   --host-config   Copy selected host ~/.config dirs into this throwaway guest
                   (interactive only; ignored with --run-tests).
                   Override dirs: OMARCHY_DEV_HOST_CONFIG_DIRS
-                  (default: omarchy hypr alacritty ghostty kitty foot walker).
+                  (default: omarchy hypr alacritty ghostty kitty foot).
+                  Copies saved Omarchy widget settings, applies the host
+                  theme and selected background, then restarts the shell.
+                  Transfer or apply failures fail the run.
                   hypr monitors.conf / monitors.lua are skipped.
 
   Default session: QEMU window + keyboard grab.

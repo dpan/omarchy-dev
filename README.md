@@ -2,6 +2,12 @@
 
 Run stock [Omarchy](https://omarchy.org) or a feature checkout in a disposable VM. A shared installed base lets test runs skip installation.
 
+<p align="center">
+  <a href="assets/omarchy-dev-vm-cropped.png">
+    <img src="assets/omarchy-dev-vm-cropped.png" alt="Omarchy running in a QEMU VM with the host theme and background" width="420">
+  </a>
+</p>
+
 ## Requirements
 
 Use an x86_64 Omarchy host with **mise 2026.10.19 or newer**. At least 20 GiB of free space is recommended.
@@ -32,6 +38,30 @@ Use `mise worktree list` or `mise worktree remove my-feature` to manage host che
 
 Feature runs use a snapshot of the checkout, including uncommitted files and deletions. The desktop and acceptance tests use that snapshot. Re-run after host edits. Guest edits are not copied back.
 
+Pending migrations from the activated checkout run in the guest before the desktop is ready or acceptance tests start. Completed migrations keep their existing markers. A failed migration stops the run.
+
+The output reports when migrations are skipped for a stock base, when no migrations are pending, and when pending migrations complete.
+
+## Test a pull request
+
+After setup, run these commands from the workspace root. Replace `123` with the Omarchy PR number:
+
+```bash
+git -C omarchy fetch origin refs/pull/123/head:refs/remotes/origin/pr-123
+mise worktree add pr-123 refs/remotes/origin/pr-123
+mise test pr-123
+```
+
+The checkout is `worktrees/pr-123/`, on branch `feature/pr-123`. This tests the PR's current head commit. Use a fresh worktree name because `worktree add` reuses an existing `feature/<name>` branch. To test a later PR revision, fetch again and create a fresh name such as `pr-123-v2` from the updated reference.
+
+To use your host settings, run `mise test --host-config pr-123`. For automated checks without a window or keyboard capture, run:
+
+```bash
+mise test --run-tests --ssh --no-grab-kbd pr-123
+```
+
+Shut down an interactive guest before starting another run. Each run applies pending migrations inside its disposable overlay. PR changes to installation or package-owned files still need those installation or packaging steps exercised in the guest.
+
 ## Run a VM
 
 Run `mise test` for stock Omarchy or `mise test <tree>` for a worktree name or checkout path. Add these options as needed:
@@ -58,7 +88,9 @@ Each run uses a fresh disk overlay and leaves the base disk unchanged.
 
 ### Copy host configuration
 
-`--host-config` copies `omarchy`, `hypr`, `alacritty`, `ghostty`, `kitty`, `foot`, and `walker` from host `~/.config`. Override the list with `OMARCHY_DEV_HOST_CONFIG_DIRS`.
+`--host-config` copies `omarchy`, `hypr`, `alacritty`, `ghostty`, `kitty`, and `foot` from host `~/.config`. Override the list with `OMARCHY_DEV_HOST_CONFIG_DIRS`. Quattro shell/bar settings and plugins live under `~/.config/omarchy` (`shell.json`, `plugins/`, themes). Retired dirs such as `walker` and `waybar` are not in the default list.
+
+The copy also includes saved widget preferences from `~/.local/state/omarchy/settings`. Worktree runs migrate the copied settings first. The guest then applies the host theme from `~/.local/state/omarchy/current/theme.name`, restores the selected background using a guest-local copy of its image or video, and restarts the shell so the configuration and plugins take effect. Missing optional preferences are skipped; a failed transfer, migration, theme application, background restoration, or shell restart fails the run.
 
 The copy skips `hypr/monitors.conf` and `hypr/monitors.lua`, applies only to that run, and is ignored with `--run-tests`.
 
@@ -73,6 +105,8 @@ mise rebase status   # Inspect the selected ISO and base
 Targets are `edge`, `stable`, `rc`, a listed version or ISO filename, or a local ISO path. Channels select the newest available image. With no target, `mise rebase` opens a picker using `gum`.
 
 Rebase reinstalls and selects the chosen base. Setup creates a missing base or reuses a verified one. Existing disks without valid `base.complete` evidence require an explicit rebase, including older bases. Keep selected ISOs at their paths. Moving or replacing one can require a rebuild.
+
+A filesystem device-number change after a remount does not invalidate completion evidence. The ISO path, file inodes, sizes, and timestamps must still match.
 
 ## Setup options
 

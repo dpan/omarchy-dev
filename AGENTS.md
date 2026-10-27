@@ -14,9 +14,12 @@ This meta repository manages local Omarchy checkouts and disposable VM tests. Us
 - Resolve the requested ISO once and pass that path through setup/rebase. Path-returning helpers print only the path to stdout; diagnostics go to stderr.
 - `test-runs/CURRENT` is authoritative when present and stores the canonical ISO path; legacy release basenames remain readable. Discovery, health, and status never write selection. Successful base preparation publishes selection atomically.
 - Base reuse requires matching `base.complete` evidence for the ISO and disk, a standalone qcow2 image, and readable, nonempty firmware/SSH files. Invalidate completion before rebuilding; publish it only after installation and image consistency checks succeed. Do not infer installation success from file size. Leave mutable firmware out of fingerprints.
+- Ignore filesystem device numbers when comparing completion fingerprints; remounts can change them. Keep checking the recorded paths, inodes, sizes, and timestamps, and preserve existing completion records during read-only checks.
 - Worktree sync preserves exact working files, including deletions, additions, modes, and symlinks, with independent Git metadata. Desktop activation and acceptance must use the same guest path. Resolve caller-relative paths before changing directory; clean temporary snapshots on exit.
 - Required startup, sync, activation, and transfer failures must propagate explicitly. Bash suppresses `errexit` through functions invoked in conditionals; use explicit failure returns and `pipefail` for transfer pipelines.
 - Keep host-config copies in disposable overlays and disabled during automated checks. Preserve monitor-file exclusions. QEMU extra arguments are single-line whitespace-delimited values; never eval them or expand wildcards.
+- Host-config restore includes portable Omarchy widget settings and the selected theme/background. Rebuild background references with guest-local paths. Apply appearance through the guest session environment using its active checkout. Required transfer, apply, and shell-restart failures must prevent readiness.
+- Activated worktree runs apply pending migrations as the guest user against the active checkout before readiness or tests. Copy optional host settings before migrations, then apply appearance and restart the shell. Preserve completion markers and keep migration authorization inside the disposable guest.
 
 ## Harness patch
 
